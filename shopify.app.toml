@@ -1,0 +1,36 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "acf943cbc8ac6bb4a9fc21583d9fd292"
+name = "Content-Builder"
+handle = "content-builder"
+application_url = "https://pond-tsunami-twelve-spots.trycloudflare.com"
+embedded = true
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2025-04"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "write_products,read_products, read_content, read_themes, read_inventory, read_product_listings"
+
+[auth]
+redirect_urls = [
+  "https://pond-tsunami-twelve-spots.trycloudflare.com/auth/callback",
+  "https://pond-tsunami-twelve-spots.trycloudflare.com/auth/shopify/callback",
+  "https://pond-tsunami-twelve-spots.trycloudflare.com/api/auth/callback"
+]
+
+[pos]
+embedded = false
