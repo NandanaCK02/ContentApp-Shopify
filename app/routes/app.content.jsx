@@ -4,6 +4,11 @@ const contentLinks = [
   { to: "/app/content/tabbed", label: "  Tabbed Content" },
   { to: "/app/content/bullet", label: " Bullet Points" },
   { to: "/app/content/table", label: "Tables" },
+  { to: "/app/content/richdescription", label: "Rich Description" },
+  { to: "/app/content/image", label: "Image Gallery" },
+  { to: "/app/content/video", label: "Video Content" },
+  { to: "/app/content/faq", label: "FAQ Section" },
+
 ];
 
 export default function ContentBuilderLayout() {

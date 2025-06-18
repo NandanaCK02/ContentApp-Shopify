@@ -13,12 +13,13 @@ import {
   ResourceItem,
 } from "@shopify/polaris";
 import { useState, useEffect } from "react";
-import prisma from "../db.server";
+import prisma from "../db.server"; //
 
 //  Loader: Fetch collections, pages, and FAQs
 export async function loader({ request }) {
   const { admin } = await authenticate.admin(request);
 
+  // Fetch collections
   const collectionQuery = `query {
     collections(first: 50) {
       edges {
@@ -32,11 +33,16 @@ export async function loader({ request }) {
   const collectionRes = await admin.graphql(collectionQuery);
   const collectionData = await collectionRes.json();
 
-  const collections = collectionData?.data?.collections?.edges?.map(({ node }) => ({
+  if (!collectionData.data?.collections) {
+    throw new Error("Failed to fetch collections");
+  }
+
+  const collections = collectionData.data.collections.edges.map(({ node }) => ({
     id: node.id,
     title: node.title,
-  })) || [];
+  }));
 
+  // Fetch pages
   const pageQuery = `query {
     pages(first: 50) {
       edges {
@@ -50,22 +56,28 @@ export async function loader({ request }) {
   const pageRes = await admin.graphql(pageQuery);
   const pageData = await pageRes.json();
 
-  const pages = pageData?.data?.pages?.edges?.map(({ node }) => ({
+  if (!pageData.data?.pages) {
+    throw new Error("Failed to fetch pages");
+  }
+
+  const pages = pageData.data.pages.edges.map(({ node }) => ({
     id: node.id,
     title: node.title,
-  })) || [];
+  }));
 
-  let faqs = [];
+  // Fetch FAQs from the database
+  let faqs;
   try {
     faqs = await prisma.faq.findMany();
   } catch (error) {
     console.error("Error fetching FAQs from Prisma:", error);
+    faqs = []; // Default to empty array if error occurs
   }
 
   return json({ collections, pages, faqs });
 }
 
-// Action: Add, Update, Delete FAQ
+//  Action: Add, Update, Delete FAQ
 export async function action({ request }) {
   const formData = await request.formData();
   const intent = formData.get("intent");
@@ -83,26 +95,24 @@ export async function action({ request }) {
   }
 
   if (intent === "update") {
-    const faqId = String(formData.get("faqId"));
     await prisma.faq.update({
-      where: { id: faqId },
+      where: { id: formData.get("faqId") },
       data: {
         question: formData.get("question"),
         answer: formData.get("answer"),
       },
     });
-    return json({ status: "updated" });
+    return redirect("/app/faq");
   }
 
   if (intent === "delete") {
-    const faqId = String(formData.get("faqId"));
     await prisma.faq.delete({
-      where: { id: faqId },
+      where: { id: formData.get("faqId") },
     });
-    return json({ status: "deleted" });
+    return redirect("/app/faq");
   }
 
-  return json({ status: "unknown" });
+  return redirect("/app/faq");
 }
 
 // Component: FAQ Management UI
@@ -112,11 +122,10 @@ export default function FAQManagement() {
   const [selectedItem, setSelectedItem] = useState(null);
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
+  const fetcher = useFetcher();
   const [editingFaqId, setEditingFaqId] = useState(null);
   const [editQuestion, setEditQuestion] = useState("");
   const [editAnswer, setEditAnswer] = useState("");
-
-  const fetcher = useFetcher();
 
   const resources = resourceType === "collections" ? collections : pages;
 
@@ -126,17 +135,10 @@ export default function FAQManagement() {
       faq.resourceType === resourceType
   );
 
-  // Reset new FAQ form after creation
   useEffect(() => {
-    if (fetcher.state === "idle" && fetcher.data?.status === "created") {
+    if (fetcher.state === "idle" && fetcher.data) {
       setQuestion("");
       setAnswer("");
-    }
-  }, [fetcher.state, fetcher.data]);
-
-  // Reset edit FAQ form after update
-  useEffect(() => {
-    if (fetcher.state === "idle" && fetcher.data?.status === "updated") {
       setEditingFaqId(null);
       setEditQuestion("");
       setEditAnswer("");
