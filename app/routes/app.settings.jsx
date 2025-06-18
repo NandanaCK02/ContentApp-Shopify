@@ -1,12 +1,12 @@
 import { Link, Outlet, useLocation } from "@remix-run/react";
 
 const contentLinks = [
-  { to: "/app/content/general", label: "  General" },
-  { to: "/app/content/appearance", label: " Appearance" },
-  { to: "/app/content/notification", label: "Notifications" },
-  { to: "/app/content/security", label: "Security" },
-  { to: "/app/content/team", label: "Team" },
-  { to: "/app/content/apikey", label: "API-KEY" },
+  { to: "/app/settings/general", label: "  General" },
+  { to: "/app/settings/appearance", label: " Appearance" },
+  { to: "/app/settings/notification", label: "Notifications" },
+  { to: "/app/settings/security", label: "Security" },
+  { to: "/app/settings/team", label: "Team" },
+  { to: "/app/settings/apikey", label: "API-KEY" },
 ];
 
 export default function ContentBuilderLayout() {

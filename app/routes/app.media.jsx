@@ -19,57 +19,62 @@ export const loader = async ({ request }) => {
 
   const { admin } = await authenticate.admin(request);
 
-  const query = `
-  query {
-  files(first: 10) {
-    edges {
-      node {
-        id
-        alt
-        createdAt
-        fileStatus
-        preview {
-          image {
-            url
+  const gql = `
+    query FetchFiles {
+      files(first: 50) {
+        edges {
+          node {
+            id
+            alt
+            createdAt
+            fileStatus
+            preview {
+              image {
+                url
+              }
+            }
+            ... on MediaImage {
+              image {
+                url
+              }
+            }
+            ... on Video {
+              sources {
+                url
+              }
+            }
+            ... on GenericFile {
+              originalFileSize
+              mimeType
+            }
           }
-        }
-        ... on MediaImage {
-          image {
-            url
-          }
-        }
-        ... on Video {
-          sources {
-            url
-          }
-        }
-        ... on GenericFile {
-          originalFileSize
-          mimeType
         }
       }
     }
-  }
-}
-
   `;
 
-  const contentTypeMap = {
-    ALL: null,
-    IMAGE: ["IMAGE"],
-    VIDEO: ["VIDEO"],
-    DOCUMENT: ["GENERIC_FILE"],
-  };
-
-  const variables = {
-    types: contentTypeMap[typeParam] || undefined,
-    search: queryParam || undefined,
-  };
-
   try {
-    const response = await admin.graphql(query, { variables });
+    const response = await admin.graphql(gql);
     const data = await response.json();
-    const files = data?.data?.files?.edges?.map((edge) => edge.node) || [];
+
+    let files = data?.data?.files?.edges?.map((edge) => edge.node) || [];
+
+    // Filter by type (in JS, since GraphQL doesn't support it)
+    files = files.filter((file) => {
+      if (typeParam === "ALL") return true;
+      if (typeParam === "IMAGE") return file.image?.url;
+      if (typeParam === "VIDEO") return file.sources?.[0]?.url;
+      if (typeParam === "DOCUMENT") return file.mimeType || file.originalFileSize;
+      return true;
+    });
+
+    // Filter by query if present
+    if (queryParam) {
+      const q = queryParam.toLowerCase();
+      files = files.filter((file) =>
+        (file.alt || "").toLowerCase().includes(q)
+      );
+    }
 
     return json({ files, query: queryParam, type: typeParam });
   } catch (error) {
@@ -142,7 +147,6 @@ export default function MediaPage() {
               files.map((node) => {
                 const previewUrl = node.preview?.image?.url;
 
-                // MediaImage
                 if (node.image?.url) {
                   return (
                     <Card key={node.id} sectioned>
@@ -154,7 +158,6 @@ export default function MediaPage() {
                   );
                 }
 
-                // Video
                 if (node.sources?.[0]?.url) {
                   return (
                     <Card key={node.id} sectioned>
@@ -164,7 +167,6 @@ export default function MediaPage() {
                   );
                 }
 
-                // Document (GenericFile)
                 if (node.mimeType || node.originalFileSize) {
                   return (
                     <Card key={node.id} sectioned>
@@ -175,7 +177,6 @@ export default function MediaPage() {
                   );
                 }
 
-                // Fallback: show preview image if nothing else
                 if (previewUrl) {
                   return (
                     <Card key={node.id} sectioned>

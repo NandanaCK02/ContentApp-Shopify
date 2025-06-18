@@ -115,13 +115,13 @@ export default function ContentTabbedPage() {
 
   return (
     <div style={{ maxWidth: 700, margin: "0 auto" }}>
-      <h2 style={{ fontSize: "1.5rem", fontWeight: 700, marginBottom: 24 }}>
+      <h2 style={{ fontSize: "1rem", fontWeight: 500, marginBottom: 24 }}>
         Tabbed Content
       </h2>
 
       {/* Product Selector */}
       <form method="get" style={{ marginBottom: 32 }}>
-        <label style={{ fontWeight: 600, marginRight: 12 }}>
+        <label style={{ fontWeight: 500, marginRight: 12 }}>
           Select Product:
         </label>
         <select
@@ -155,7 +155,7 @@ export default function ContentTabbedPage() {
             padding: 28,
             marginBottom: 28,
           }}>
-            <h3 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>
+            <h3 style={{ fontSize: 18, fontWeight: 500, marginBottom: 8 }}>
               {selectedProductTitle}
             </h3>
             <div style={{ marginBottom: 28 }}>

@@ -5,7 +5,7 @@ import { authenticate } from "../shopify.server";
 
 // ─── LOADER ────────────────────────────────────────────
 export async function loader({ request }) {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
   const query = `
     query {
@@ -31,7 +31,7 @@ export async function loader({ request }) {
     const response = await admin.graphql(query);
     const data = await response.json();
     const products = data?.data?.products?.edges || [];
-    return json({ products });
+    return json({ products, shop: session.shop });
   } catch (error) {
     console.error("Failed to fetch products:", error);
     throw new Response("Error fetching products", { status: 500 });
@@ -73,7 +73,7 @@ export async function action({ request }) {
 
 // ─── COMPONENT ─────────────────────────────────────────
 export default function ProductListPage() {
-  const { products } = useLoaderData();
+  const { products, shop } = useLoaderData();
   const fetcher = useFetcher();
 
   return (
@@ -109,6 +109,9 @@ export default function ProductListPage() {
                   totalInventory,
                   vendor,
                 } = node;
+
+                const numericId = id.split("/").pop(); // extract product ID
+                const editUrl = `https://${shop}/admin/products/${numericId}`;
 
                 return (
                   <div
@@ -151,9 +154,7 @@ export default function ProductListPage() {
                           borderRadius: "4px",
                           cursor: "pointer",
                         }}
-                        onClick={() =>
-                          window.location.assign(`/app/products/${encodeURIComponent(id)}/edit`)
-                        }
+                        onClick={() => window.open(editUrl, "_blank")}
                       >
                         Update
                       </button>
