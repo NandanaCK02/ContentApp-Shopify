@@ -1,15 +1,18 @@
-import { json, redirect } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
-import { Page, Layout, Frame } from "@shopify/polaris";
+// app/routes/app.products.jsx
+
+import { json } from "@remix-run/node";
+import { useLoaderData } from "@remix-run/react";
+import { Page, Layout, Frame, TextField, Button } from "@shopify/polaris";
+import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 
-// ─── LOADER ────────────────────────────────────────────
+// ─── LOADER: Fetch product data ──────────────────────────────
 export async function loader({ request }) {
   const { admin, session } = await authenticate.admin(request);
 
   const query = `
     query {
-      products(first: 10) {
+      products(first: 50) {
         edges {
           node {
             id
@@ -38,50 +41,56 @@ export async function loader({ request }) {
   }
 }
 
-// ─── ACTION (DELETE PRODUCT) ───────────────────────────
-export async function action({ request }) {
-  const { admin } = await authenticate.admin(request);
-  const formData = await request.formData();
-  const id = formData.get("id");
-
-  const mutation = `
-    mutation productDelete($input: ID!) {
-      productDelete(input: $input) {
-        deletedProductId
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
-
-  try {
-    const res = await admin.graphql(mutation, {
-      variables: { input: id },
-    });
-    const result = await res.json();
-    if (result.data.productDelete.userErrors.length > 0) {
-      console.error(result.data.productDelete.userErrors);
-    }
-    return redirect("/app/products");
-  } catch (error) {
-    console.error("Delete failed:", error);
-    return new Response("Error deleting product", { status: 500 });
-  }
-}
-
-// ─── COMPONENT ─────────────────────────────────────────
+// ─── COMPONENT ────────────────────────────────────────────────
 export default function ProductListPage() {
   const { products, shop } = useLoaderData();
-  const fetcher = useFetcher();
+  const allProducts = products.map(edge => edge.node);
+
+  const [searchTerm, setSearchTerm] = useState("");
+  const [filteredProducts, setFilteredProducts] = useState(allProducts);
+
+  const handleSearch = () => {
+    const term = searchTerm.toLowerCase();
+    const filtered = allProducts.filter(product =>
+      product.title.toLowerCase().includes(term)
+    );
+    setFilteredProducts(filtered);
+  };
+
+  // Optional: reset to full list when search is cleared
+  useEffect(() => {
+    if (searchTerm === "") {
+      setFilteredProducts(allProducts);
+    }
+  }, [searchTerm, allProducts]);
 
   return (
     <Frame>
       <Page title="Products">
         <Layout>
           <Layout.Section>
-            <div style={{ background: "#fff", borderRadius: "8px", padding: "1rem" }}>
+            {/* Search Input */}
+            <div style={{ display: "flex", gap: "1rem", marginBottom: "1rem" }}>
+              <TextField
+                label=""
+                value={searchTerm}
+                onChange={setSearchTerm}
+                placeholder="Search by product title"
+                autoComplete="off"
+              />
+              <Button onClick={handleSearch} primary>
+                Search
+              </Button>
+            </div>
+
+            {/* Table Header */}
+            <div
+              style={{
+                background: "#fff",
+                borderRadius: "8px",
+                padding: "1rem",
+              }}
+            >
               <div
                 style={{
                   display: "grid",
@@ -99,7 +108,8 @@ export default function ProductListPage() {
                 <div>Actions</div>
               </div>
 
-              {products.map(({ node }) => {
+              {/* Product Rows */}
+              {filteredProducts.map(product => {
                 const {
                   id,
                   title,
@@ -108,9 +118,9 @@ export default function ProductListPage() {
                   productType,
                   totalInventory,
                   vendor,
-                } = node;
+                } = product;
 
-                const numericId = id.split("/").pop(); // extract product ID
+                const numericId = id.split("/").pop();
                 const editUrl = `https://${shop}/admin/products/${numericId}`;
 
                 return (
@@ -144,36 +154,10 @@ export default function ProductListPage() {
                     <div>{totalInventory} in stock</div>
                     <div>{productType || "Uncategorized"}</div>
                     <div>{vendor || "N/A"}</div>
-                    <div style={{ display: "flex", gap: "0.5rem" }}>
-                      <button
-                        style={{
-                          padding: "4px 8px",
-                          background: "#007bff",
-                          color: "#fff",
-                          border: "none",
-                          borderRadius: "4px",
-                          cursor: "pointer",
-                        }}
-                        onClick={() => window.open(editUrl, "_blank")}
-                      >
+                    <div>
+                      <Button onClick={() => window.open(editUrl, "_blank")}>
                         Update
-                      </button>
-                      <fetcher.Form method="post">
-                        <input type="hidden" name="id" value={id} />
-                        <button
-                          type="submit"
-                          style={{
-                            padding: "4px 8px",
-                            background: "#dc3545",
-                            color: "#fff",
-                            border: "none",
-                            borderRadius: "4px",
-                            cursor: "pointer",
-                          }}
-                        >
-                          Delete
-                        </button>
-                      </fetcher.Form>
+                      </Button>
                     </div>
                   </div>
                 );
