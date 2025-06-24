@@ -3,7 +3,7 @@ import { Link, useLocation } from "@remix-run/react";
 const links = [
   {to: "/app/dashboard", label: " Dashboard" },
   { to: "/app/content", label: " Content Builder" },
-  { to: "/app/products", label: " Product Manager" },
+  { to: "/app/metafield", label: "Custom Metafield" },
   { to: "/app/media", label: " Media" },
   { to: "/app/analytics", label: " Analytics" },
   { to: "/app/faq", label: " FAQ-Manager" },

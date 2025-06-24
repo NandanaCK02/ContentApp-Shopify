@@ -3,7 +3,7 @@
 client_id = "acf943cbc8ac6bb4a9fc21583d9fd292"
 name = "Content-Builder"
 handle = "content-builder"
-application_url = "https://monaco-phd-lb-fp.trycloudflare.com"
+application_url = "https://examines-caught-inspired-universal.trycloudflare.com"
 embedded = true
 
 [build]
@@ -27,9 +27,9 @@ scopes = "write_products,read_products, read_content, read_themes, read_inventor
 
 [auth]
 redirect_urls = [
-  "https://monaco-phd-lb-fp.trycloudflare.com/auth/callback",
-  "https://monaco-phd-lb-fp.trycloudflare.com/auth/shopify/callback",
-  "https://monaco-phd-lb-fp.trycloudflare.com/api/auth/callback"
+  "https://examines-caught-inspired-universal.trycloudflare.com/auth/callback",
+  "https://examines-caught-inspired-universal.trycloudflare.com/auth/shopify/callback",
+  "https://examines-caught-inspired-universal.trycloudflare.com/api/auth/callback"
 ]
 
 [pos]
