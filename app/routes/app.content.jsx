@@ -36,7 +36,6 @@ const contentLinks = [
   { to: "/app/content/bullet", label: "Bullet Points" },
   { to: "/app/content/table", label: "Tables" },
   { to: "/app/content/richdescription", label: "Rich Description" },
-
   { to: "/app/content/faq", label: "FAQ Section" },
 ];
 
@@ -46,10 +45,34 @@ export default function ContentBuilderLayout() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
+  const [searchText, setSearchText] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+
   const selectedProductId = searchParams.get("productId") || "";
 
-  function handleProductChange(e) {
-    const productId = e.target.value;
+  useEffect(() => {
+    if (selectedProductId) {
+      const selectedProduct = products.find(p => p.id === selectedProductId);
+      if (selectedProduct) {
+        setSearchText(selectedProduct.title);
+      }
+    }
+  }, [selectedProductId, products]);
+
+  function handleSearchChange(e) {
+    const value = e.target.value;
+    setSearchText(value);
+
+    const filtered = products.filter(p =>
+      p.title.toLowerCase().includes(value.toLowerCase())
+    );
+    setSuggestions(filtered);
+  }
+
+  function handleProductSelect(productId) {
+    const selectedProduct = products.find(p => p.id === productId);
+    setSearchText(selectedProduct?.title || "");
+    setSuggestions([]);
     navigate(`${location.pathname}?productId=${encodeURIComponent(productId)}`);
   }
 
@@ -64,12 +87,14 @@ export default function ContentBuilderLayout() {
           padding: "1.5rem",
         }}
       >
-        {/* Product Selector (Common Search Bar) */}
+        {/* Product Search (Auto Suggestion) */}
         <div style={{ marginBottom: "2rem" }}>
-          <label style={{ fontWeight: "600", display: "block", marginBottom: "8px" }}>Select Product</label>
-          <select
-            value={selectedProductId}
-            onChange={handleProductChange}
+          <label style={{ fontWeight: "600", display: "block", marginBottom: "8px" }}>Search Product</label>
+          <input
+            type="text"
+            value={searchText}
+            onChange={handleSearchChange}
+            placeholder="Start typing product name"
             style={{
               width: "100%",
               padding: "8px 12px",
@@ -77,14 +102,37 @@ export default function ContentBuilderLayout() {
               border: "1px solid #ccc",
               fontSize: "14px",
             }}
-          >
-            <option value="">-- Select Product --</option>
-            {products.map(p => (
-              <option key={p.id} value={p.id}>
-                {p.title}
-              </option>
-            ))}
-          </select>
+          />
+
+          {/* Suggestions Dropdown */}
+          {suggestions.length > 0 && (
+            <ul
+              style={{
+                border: "1px solid #ccc",
+                marginTop: "4px",
+                borderRadius: "6px",
+                maxHeight: "200px",
+                overflowY: "auto",
+                backgroundColor: "white",
+                padding: "0",
+                listStyle: "none",
+              }}
+            >
+              {suggestions.map(product => (
+                <li
+                  key={product.id}
+                  onClick={() => handleProductSelect(product.id)}
+                  style={{
+                    padding: "8px 12px",
+                    cursor: "pointer",
+                    borderBottom: "1px solid #eee",
+                  }}
+                >
+                  {product.title}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         {/* Content Navigation */}
