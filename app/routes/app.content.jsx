@@ -63,10 +63,21 @@ export default function ContentBuilderLayout() {
     const value = e.target.value;
     setSearchText(value);
 
-    const filtered = products.filter(p =>
-      p.title.toLowerCase().includes(value.toLowerCase())
-    );
-    setSuggestions(filtered);
+    if (value.trim() === "") {
+      setSuggestions([]); // hide suggestions when input is empty
+    } else {
+      const filtered = products.filter(p =>
+        p.title.toLowerCase().includes(value.toLowerCase())
+      );
+      setSuggestions(filtered);
+    }
+  }
+
+  function handleInputFocus() {
+    if (searchText.trim() === "") {
+      // Show first 5 as recommendation dropdown on focus
+      setSuggestions(products.slice(0, 5));
+    }
   }
 
   function handleProductSelect(productId) {
@@ -87,13 +98,14 @@ export default function ContentBuilderLayout() {
           padding: "1.5rem",
         }}
       >
-        {/* Product Search (Auto Suggestion) */}
-        <div style={{ marginBottom: "2rem" }}>
+        {/* Product Search */}
+        <div style={{ marginBottom: "2rem", position: "relative" }}>
           <label style={{ fontWeight: "600", display: "block", marginBottom: "8px" }}>Search Product</label>
           <input
             type="text"
             value={searchText}
             onChange={handleSearchChange}
+            onFocus={handleInputFocus}
             placeholder="Start typing product name"
             style={{
               width: "100%",
@@ -108,14 +120,18 @@ export default function ContentBuilderLayout() {
           {suggestions.length > 0 && (
             <ul
               style={{
+                position: "absolute",
+                top: "100%",
+                left: 0,
+                right: 0,
                 border: "1px solid #ccc",
-                marginTop: "4px",
                 borderRadius: "6px",
                 maxHeight: "200px",
                 overflowY: "auto",
                 backgroundColor: "white",
                 padding: "0",
                 listStyle: "none",
+                zIndex: 999,
               }}
             >
               {suggestions.map(product => (

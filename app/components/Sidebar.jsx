@@ -4,8 +4,7 @@ const links = [
   {to: "/app/dashboard", label: " Dashboard" },
   { to: "/app/content", label: " Content Builder" },
   { to: "/app/metafield", label: "Metafield Editor" },
-  { to: "/app/media", label: " Media" },
-  { to: "/app/analytics", label: " Analytics" },
+  { to: "/app/media", label: " Media" }, 
   { to: "/app/faq", label: " FAQ-Manager" },
   { to: "/app/settings", label: " Settings" }
 ];

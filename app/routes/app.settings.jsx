@@ -1,61 +1,107 @@
-import { Link, Outlet, useLocation } from "@remix-run/react";
+// routes/app.settings.jsx
+import { json } from "@remix-run/node";
+import { useLoaderData, Form, useActionData } from "@remix-run/react";
 
-const contentLinks = [
-  { to: "/app/settings/general", label: "  General" },
-  { to: "/app/settings/appearance", label: " Appearance" },
-  { to: "/app/settings/notification", label: "Notifications" },
-  { to: "/app/settings/security", label: "Security" },
-  { to: "/app/settings/team", label: "Team" },
-  { to: "/app/settings/apikey", label: "API-KEY" },
-];
+// Loader to provide initial values
+export async function loader() {
+  // Later you can fetch from Firestore or Shopify metafields
+  return json({
+    defaultContentType: "faq",
+    autoPublish: true,
+    blockPosition: "above",
+  });
+}
 
-export default function ContentBuilderLayout() {
-  const location = useLocation();
+// Action to handle form submission
+export async function action({ request }) {
+  const formData = await request.formData();
+  const values = Object.fromEntries(formData);
+
+  // Replace this with logic to save in DB or metafields
+  console.log("Saved settings:", values);
+
+  return json({ success: true, saved: values });
+}
+
+export default function GeneralSettingsPage() {
+  const data = useLoaderData();
+  const actionData = useActionData();
 
   return (
-    <div style={{ display: "flex", height: "100vh", backgroundColor: "#f9fafb" }}>
-      {/* Mini-sidebar for content types */}
-      <aside
-        style={{
-          width: "260px",
-          backgroundColor: "#fffef2",
-          borderRight: "1px solid #e5e7eb",
-          padding: "1.5rem",
-        }}
-      >
-        <h2 style={{ fontSize: "18px", fontWeight: "600", marginBottom: "1.2rem" }}>
-          Content Types
-        </h2>
+    <div style={{ padding: "2rem", maxWidth: "640px", margin: "0 auto" }}>
+      <h1 style={{ fontSize: "24px", fontWeight: "600", marginBottom: "1.5rem" }}>
+        App Settings
+      </h1>
 
-        <nav style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
-          {contentLinks.map((link) => {
-            const isActive = location.pathname === link.to;
-            return (
-              <Link
-                key={link.to}
-                to={link.to}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: "8px",
-                  backgroundColor: isActive ? "#7c3aed" : "transparent",
-                  color: isActive ? "#fff" : "#111827",
-                  textDecoration: "none",
-                  fontWeight: isActive ? "600" : "500",
-                  transition: "background 0.2s",
-                  border: isActive ? "1px solid #7c3aed" : "1px solid transparent",
-                }}
-              >
-                {link.label}
-              </Link>
-            );
-          })}
-        </nav>
-      </aside>
+      <Form method="post">
+        {/* Default Content Type */}
+        <div style={{ marginBottom: "1.5rem" }}>
+          <label style={{ fontWeight: "600", display: "block", marginBottom: "8px" }}>
+            Default Content Type
+          </label>
+          <select
+            name="defaultContentType"
+            defaultValue={data.defaultContentType}
+            style={{ padding: "10px", width: "100%", fontSize: "16px" }}
+          >
+            <option value="faq">FAQ</option>
+            <option value="table">Table</option>
+            <option value="bullet">Bullet Points</option>
+            <option value="richdescription">Rich Description</option>
+            <option value="tabbed">Tabbed</option>
+          </select>
+        </div>
 
-      {/* Editor Area */}
-      <main style={{ flex: 1, padding: "2rem" }}>
-        <Outlet />
-      </main>
+        {/* Block Position */}
+        <div style={{ marginBottom: "1.5rem" }}>
+          <label style={{ fontWeight: "600", display: "block", marginBottom: "8px" }}>
+            Block Position
+          </label>
+          <select
+            name="blockPosition"
+            defaultValue={data.blockPosition}
+            style={{ padding: "10px", width: "100%", fontSize: "16px" }}
+          >
+            <option value="above">Above Product Description</option>
+            <option value="below">Below Product Description</option>
+          </select>
+        </div>
+
+        {/* Auto Publish */}
+        <div style={{ marginBottom: "1.5rem" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "16px" }}>
+            <input
+              type="checkbox"
+              name="autoPublish"
+              defaultChecked={data.autoPublish}
+            />
+            Auto-publish content to storefront
+          </label>
+        </div>
+
+        {/* Save Button */}
+        <button
+          type="submit"
+          style={{
+            padding: "10px 18px",
+            backgroundColor: "#7c3aed",
+            color: "#fff",
+            fontWeight: "600",
+            border: "none",
+            borderRadius: "6px",
+            cursor: "pointer",
+          }}
+        >
+          Save Settings
+        </button>
+      </Form>
+
+      {/* Confirmation Message */}
+      {actionData?.success && (
+        <p style={{ marginTop: "1rem", color: "green" }}>
+          ✅ Settings saved successfully!
+        </p>
+      )}
     </div>
   );
 }

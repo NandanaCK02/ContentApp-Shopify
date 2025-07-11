@@ -1,4 +1,4 @@
-import { json } from "@remix-run/node";
+import { json, unstable_createMemoryUploadHandler, unstable_parseMultipartFormData } from "@remix-run/node";
 import { useLoaderData, useFetcher } from "@remix-run/react";
 import { authenticate } from "../shopify.server";
 import {
@@ -11,7 +11,7 @@ import {
   Select,
   Text,
 } from "@shopify/polaris";
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 
 // Type Map (remains unchanged)
 const typeMap = {
@@ -103,7 +103,7 @@ export async function loader({ request }) {
         return {
           ...e.node,
           type: typeMap[typeKey] || e.node.type.name,
-          originalType: e.node.type.name, // Store original Shopify type name
+          originalType: e.node.type.name,
         };
       })
     );
@@ -114,47 +114,156 @@ export async function loader({ request }) {
   return json({ products, definitions });
 }
 
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 2000;
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 export async function action({ request }) {
+  const contentType = request.headers.get("content-type");
+  if (request.method === "POST" && contentType?.includes("multipart/form-data")) {
+    const uploadHandler = unstable_createMemoryUploadHandler({ maxPartSize: 10_000_000 });
+    const formData = await unstable_parseMultipartFormData(request, uploadHandler);
+    const file = formData.get("file");
+    if (!file || typeof file !== "object") {
+      return json({ success: false, error: "No file uploaded" }, { status: 400 });
+    }
+    const { admin } = await authenticate.admin(request);
+
+    // 1. Get staged upload target
+    const stagedUploadRes = await admin.graphql(`
+      mutation {
+        stagedUploadsCreate(input: [{
+          filename: "${file.name}",
+          mimeType: "${file.type}",
+          resource: FILE,
+          httpMethod: POST
+        }]) {
+          stagedTargets { url resourceUrl parameters { name value } }
+          userErrors { field message }
+        }
+      }
+    `);
+    const stagedUploadData = await stagedUploadRes.json();
+    const target = stagedUploadData.data?.stagedUploadsCreate?.stagedTargets?.[0];
+    if (!target) {
+      console.error("Failed to get staged upload target:", stagedUploadData.data?.stagedUploadsCreate?.userErrors);
+      return json({ success: false, error: "Failed to prepare file upload." }, { status: 500 });
+    }
+
+    // 2. Upload file to Shopify storage
+    const formUpload = new FormData();
+    for (const param of target.parameters) formUpload.append(param.name, param.value);
+    formUpload.append("file", file);
+    const uploadResponse = await fetch(target.url, { method: "POST", body: formUpload });
+    if (!uploadResponse.ok) {
+      console.error("Failed to upload to Shopify storage:", uploadResponse.statusText);
+      return json({ success: false, error: "Failed to upload file to Shopify's storage." }, { status: 500 });
+    }
+
+    // 3. Register file in Shopify
+    let createdFileId = null;
+    try {
+      const fileCreateRes = await admin.graphql(`
+        mutation {
+          fileCreate(files: [{
+            originalSource: "${target.resourceUrl}",
+            contentType: FILE,
+            alt: "${file.name}"
+          }]) {
+            files { ... on GenericFile { id url } }
+            userErrors { field message }
+          }
+        }
+      `);
+      const fileCreateData = await fileCreateRes.json();
+      const createdFile = fileCreateData.data?.fileCreate?.files?.[0];
+      const userErrors = fileCreateData.data?.fileCreate?.userErrors || [];
+
+      if (userErrors.length > 0) {
+        console.error("Errors during file creation:", userErrors);
+        return json({ success: false, error: userErrors.map(e => e.message).join(", ") }, { status: 500 });
+      }
+      if (!createdFile || !createdFile.id) {
+        console.error("File creation successful but no ID returned:", fileCreateData);
+        return json({ success: false, error: "Shopify created the file, but its ID wasn't immediately available." }, { status: 500 });
+      }
+      createdFileId = createdFile.id;
+    } catch (err) {
+      console.error("Error creating file in Shopify:", err);
+      return json({ success: false, error: "An unexpected error occurred during file registration with Shopify." }, { status: 500 });
+    }
+
+    // 4. Poll for the file URL with retries
+    let fileUrl = null;
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      await delay(RETRY_DELAY_MS);
+      const fetchFileRes = await admin.graphql(`
+        query getFileUrl($id: ID!) {
+          node(id: $id) {
+            ... on GenericFile {
+              url
+            }
+          }
+        }
+      `, { variables: { id: createdFileId } });
+
+      const fetchFileData = await fetchFileRes.json();
+      const fetchedFile = fetchFileData.data?.node;
+
+      if (fetchedFile?.url && /^https?:\/\//.test(fetchedFile.url)) {
+        fileUrl = fetchedFile.url;
+        break;
+      }
+      console.log(`Retry ${i + 1}/${MAX_RETRIES}: File URL not ready for ID ${createdFileId}`);
+    }
+
+    if (!fileUrl) {
+      console.error(`Failed to get final file URL after ${MAX_RETRIES} retries for ID: ${createdFileId}`);
+      return json({
+        success: false,
+        error: "Shopify is still processing your file. Please try again later or manually update the metafield.",
+        fileId: createdFileId,
+      }, { status: 500 });
+    }
+
+    return json({ success: true, url: fileUrl, intent: "uploadFile" });
+  }
+
   const { admin } = await authenticate.admin(request);
   const form = await request.formData();
   const intent = form.get("intent");
 
   if (intent === "updateMetafield") {
     const productId = form.get("productId");
-    const definition = form.get("definition"); // "namespace___key___originalType"
-    const value = form.get("value"); // This value is already prepared by the frontend
-
+    const definition = form.get("definition");
+    const value = form.get("value");
     if (!productId || !definition || value === null) {
       return json({ success: false, errors: [{ message: "Product ID, definition, and value are required." }], intent: "updateMetafield" });
     }
-
     const [namespace, key, originalType] = definition.split("___");
-
-   const mutation = `
-  mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      metafields {
-        key
-        namespace
-        value
-      }
-      userErrors {
-        field
-        message
-      }
+    if (originalType === "URL" && !/^https?:\/\//.test(value)) {
+      return json({
+        success: false,
+        errors: [{ message: "URL metafield value must start with http:// or https://." }],
+        intent: "updateMetafield",
+      });
     }
-  }
-`;
-
-
+    const mutation = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { key namespace value }
+          userErrors { field message }
+        }
+      }
+    `;
     const variables = {
       metafields: [
         {
           ownerId: productId,
           namespace,
           key,
-          type: originalType, // Use the original Shopify type name for the mutation
-          value: value, // Use the prepared value directly
+          type: originalType,
+          value: value,
         },
       ],
     };
@@ -177,7 +286,7 @@ export async function action({ request }) {
     }
   } else if (intent === "getMetafieldValue") {
     const productId = form.get("productId");
-    const definition = form.get("definition"); // "namespace___key___originalType"
+    const definition = form.get("definition");
 
     if (!productId || !definition) {
       return json({ success: false, errors: [{ message: "Product ID and definition are required to fetch metafield." }], intent: "getMetafieldValue" });
@@ -223,24 +332,24 @@ export async function action({ request }) {
 
 export default function ProductMetafieldEditor() {
   const { products, definitions } = useLoaderData();
-  const fetcher = useFetcher(); // Use useFetcher for client-side data mutations/fetches
+  const fetcher = useFetcher();
+  const fileInputRef = useRef(null);
 
   const [productSearch, setProductSearch] = useState("");
   const [selectedProductId, setSelectedProductId] = useState("");
   const [selectedDef, setSelectedDef] = useState("");
-  const [value, setValue] = useState(""); // State for single value metafields
-  const [listValues, setListValues] = useState([""]); // State for list metafields
+  const [value, setValue] = useState("");
+  const [listValues, setListValues] = useState([""]);
+  const [uploading, setUploading] = useState(false);
 
-  // Effect to clear form and show success message after successful update
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.intent === "updateMetafield") {
-      // Clear form inputs after a successful update
       setProductSearch("");
       setSelectedProductId("");
       setSelectedDef("");
       setValue("");
       setListValues([""]);
-      // You can add a Polaris Toast for better UX here if needed
+      setUploading(false);
     }
   }, [fetcher.data]);
 
@@ -250,7 +359,7 @@ export default function ProductMetafieldEditor() {
   );
 
   const filteredProductOptions = useMemo(() => {
-    if (!productSearch) return productOptions.slice(0, 20); // Limit initial display
+    if (!productSearch) return productOptions.slice(0, 20);
     return productOptions.filter((option) =>
       option.label.toLowerCase().includes(productSearch.toLowerCase())
     );
@@ -262,92 +371,103 @@ export default function ProductMetafieldEditor() {
       const selectedProduct = productOptions.find((p) => p.value === id);
       setProductSearch(selectedProduct?.label || "");
       setSelectedProductId(id);
-      setSelectedDef(""); // Clear definition when product changes
-      setValue(""); // Clear value when product changes
-      setListValues([""]); // Clear list values when product changes
+      setSelectedDef("");
+      setValue("");
+      setListValues([""]);
     },
     [productOptions]
   );
 
   const definitionOptions = definitions.map((def) => ({
     label: `${def.name} (${def.namespace}.${def.key})`,
-    value: `${def.namespace}___${def.key}___${def.originalType}`, // Include originalType for action
-    type: def.originalType, // Store originalType for client-side logic
+    value: `${def.namespace}___${def.key}___${def.originalType}`,
+    type: def.type,
+    originalType: def.originalType,
   }));
 
   const selectedDefObj = definitionOptions.find((d) => d.value === selectedDef);
-  const selectedType = selectedDefObj?.type || ""; // Shopify's original type (e.g., "SINGLE_LINE_TEXT_FIELD", "LIST.STRING", "JSON")
-
-  // Determine if the currently selected definition is a list type
+  const selectedType = selectedDefObj?.type || "";
+  const selectedOriginalType = selectedDefObj?.originalType || "";
   const isListType = selectedType.startsWith("list.");
-  // Determine if the currently selected definition is a JSON type
   const isJsonType = selectedType === "json";
 
-  // Effect to fetch metafield value when product or definition changes
   useEffect(() => {
     if (selectedProductId && selectedDef) {
-      // Clear current value displays before fetching new ones
       setValue("");
       setListValues([""]);
-
-      // Trigger fetcher to get current metafield value
       fetcher.submit(
         {
           intent: "getMetafieldValue",
           productId: selectedProductId,
           definition: selectedDef,
         },
-        { method: "post", action: "." } // Action to the current route's action function
+        { method: "post", action: "." }
       );
     }
   }, [selectedProductId, selectedDef]);
 
-  // Effect to populate value fields when fetcher data arrives from "getMetafieldValue" intent
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.intent === "getMetafieldValue") {
       const fetchedValue = fetcher.data.value;
       const fetchedOriginalType = fetcher.data.originalType;
 
       if (fetchedValue !== null && fetchedValue !== undefined) {
-        if (fetchedOriginalType.startsWith("list.")) {
+        if (fetchedOriginalType.startsWith("LIST.")) {
           try {
             const parsedValue = JSON.parse(fetchedValue);
             if (Array.isArray(parsedValue)) {
-              // Ensure there's at least one empty string if the list is empty for adding new items easily
               setListValues(parsedValue.length > 0 ? parsedValue : [""]);
             } else {
-              // Fallback for malformed list JSON, treat as a single item
               setListValues([fetchedValue]);
             }
           } catch (e) {
-            console.error("Failed to parse list metafield value:", e);
-            setListValues([fetchedValue]); // Fallback to single item if JSON parsing fails
+            setListValues([fetchedValue]);
           }
-        } else if (fetchedOriginalType === "json") {
+        } else if (fetchedOriginalType === "JSON") {
           try {
             const parsedValue = JSON.parse(fetchedValue);
-            // If JSON is an array, treat as list. Otherwise, treat as single string.
             if (Array.isArray(parsedValue)) {
               setListValues(parsedValue.length > 0 ? parsedValue : [""]);
-              setValue(""); // Ensure single value field is clear
+              setValue("");
             } else {
-              setValue(fetchedValue); // Display raw JSON string for non-array JSON
-              setListValues([""]); // Ensure list field is clear
+              setValue(fetchedValue);
+              setListValues([""]);
             }
           } catch (e) {
-            console.error("Failed to parse JSON metafield value:", e);
-            setValue(fetchedValue); // Display raw string if JSON parsing fails
-            setListValues([""]); // Ensure list field is clear
+            setValue(fetchedValue);
+            setListValues([""]);
           }
         } else {
-          // For single value types (STRING, INTEGER, BOOLEAN, etc.)
           setValue(fetchedValue);
-          setListValues([""]); // Ensure list field is clear
+          setListValues([""]);
         }
       } else {
-        // Metafield does not exist or has no value, reset inputs
         setValue("");
         setListValues([""]);
+      }
+    }
+  }, [fetcher.data]);
+
+  // Only set the value after upload, don't auto-save!
+  useEffect(() => {
+    if (
+      fetcher.data?.intent === "uploadFile" &&
+      fetcher.data?.success &&
+      selectedProductId &&
+      selectedDef
+    ) {
+      const uploadedFileUrl = fetcher.data.url;
+      setValue(uploadedFileUrl);
+      // No auto-submit!
+    }
+  }, [fetcher.data, selectedProductId, selectedDef]);
+
+  useEffect(() => {
+    if (fetcher.data?.intent === "uploadFile") {
+      setUploading(false);
+      if (!fetcher.data?.success) {
+        alert(fetcher.data.error || "Failed to upload file.");
+        setValue("");
       }
     }
   }, [fetcher.data]);
@@ -365,21 +485,26 @@ export default function ProductMetafieldEditor() {
   const handleRemoveListItem = useCallback((index) => {
     const updated = [...listValues];
     updated.splice(index, 1);
-    // If all items are removed, add an empty one back to allow adding new items easily
     setListValues(updated.length > 0 ? updated : [""]);
   }, [listValues]);
 
-  // Determine the final value to submit based on type and input state
   let finalValueForSubmission = value;
   if (isListType || (isJsonType && Array.isArray(listValues) && listValues.length > 0 && listValues.some(v => v.trim() !== ""))) {
-    // If it's a list type, or a JSON type currently being edited as a list
     finalValueForSubmission = JSON.stringify(listValues.filter((v) => v.trim() !== ""));
   } else if (isJsonType && value) {
-    // If it's a JSON type being edited as a single string
-    // Shopify expects a string for the value, and validates its JSON format
     finalValueForSubmission = value;
   }
-  // For other types, finalValueForSubmission remains 'value'
+
+  const handleFileChange = async (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      setUploading(true);
+      setValue("Uploading...");
+      const formData = new FormData();
+      formData.append("file", file);
+      fetcher.submit(formData, { method: "post", encType: "multipart/form-data" });
+    }
+  };
 
   return (
     <Page title="✏️ Update Product Metafield Value">
@@ -398,7 +523,6 @@ export default function ProductMetafieldEditor() {
                   textField={
                     <Autocomplete.TextField
                       label="Search Product"
-                      
                       value={productSearch}
                       onChange={setProductSearch}
                       placeholder="Start typing a product name"
@@ -416,8 +540,8 @@ export default function ProductMetafieldEditor() {
                   options={definitionOptions}
                   onChange={(value) => {
                     setSelectedDef(value);
-                    setValue(""); // Clear current value immediately
-                    setListValues([""]); // Clear list values immediately
+                    setValue("");
+                    setListValues([""]);
                   }}
                   value={selectedDef}
                   placeholder="Select a metafield definition"
@@ -427,10 +551,9 @@ export default function ProductMetafieldEditor() {
 
               {/* Value Field (conditionally rendered) */}
               <div style={{ marginBottom: "1.5rem" }}>
-                {selectedDef && ( // Only show value input if a definition is selected
+                {selectedDef && (
                   <>
                     {isListType || (isJsonType && Array.isArray(listValues) && listValues.length > 0 && listValues.some(v => v.trim() !== "")) ? (
-                      // Render for list types or JSON types being treated as lists
                       <>
                         {listValues.map((item, index) => (
                           <div
@@ -450,10 +573,10 @@ export default function ProductMetafieldEditor() {
                                 autoComplete="off"
                                 fullWidth
                                 label={index === 0 ? "Metafield Value (List Item)" : undefined}
-                                labelHidden={index !== 0} // Hide label for subsequent items
+                                labelHidden={index !== 0}
                               />
                             </div>
-                            {listValues.length > 1 && ( // Only show remove button if more than one item
+                            {listValues.length > 1 && (
                               <button
                                 type="button"
                                 onClick={() => handleRemoveListItem(index)}
@@ -490,7 +613,6 @@ export default function ProductMetafieldEditor() {
                         </button>
                       </>
                     ) : selectedType === "color" ? (
-                      // Render for color type
                       <label>
                         <Text as="p" variant="bodyMd">Metafield Value</Text>
                         <input
@@ -500,8 +622,39 @@ export default function ProductMetafieldEditor() {
                           style={{ width: "100px", height: "40px", border: "1px solid #c4c4c4", borderRadius: "4px" }}
                         />
                       </label>
+                    ) : selectedType === "url" ? (
+                      <>
+                        <Text as="p" variant="bodyMd">Upload PDF (or enter a URL)</Text>
+                        <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+                          <Button
+                            onClick={() => fileInputRef.current?.click()}
+                            disabled={uploading}
+                          >
+                            Upload PDF
+                          </Button>
+                          <input
+                            type="file"
+                            accept="application/pdf"
+                            style={{ display: "none" }}
+                            ref={fileInputRef}
+                            onChange={handleFileChange}
+                          />
+                          {uploading && (
+                            <Text as="span" variant="bodySm" color="subdued">
+                              Uploading...
+                            </Text>
+                          )}
+                        </div>
+                        <TextField
+                          label="Metafield Value (URL)"
+                          value={value}
+                          onChange={setValue}
+                          autoComplete="off"
+                          fullWidth
+                          placeholder="Paste a URL or upload a PDF"
+                        />
+                      </>
                     ) : (
-                      // Render for all other single value types
                       <TextField
                         label="Metafield Value"
                         value={value}
@@ -520,8 +673,15 @@ export default function ProductMetafieldEditor() {
               <Button
                 submit
                 primary
-                loading={fetcher.state === "submitting" || fetcher.state === "loading"} // Show loading for both submission and fetching
-                disabled={!selectedProductId || !selectedDef || fetcher.state === "submitting" || fetcher.state === "loading"} // Disable if product/def not selected or fetching/submitting
+                loading={fetcher.state === "submitting" || fetcher.state === "loading"}
+                disabled={
+                  !selectedProductId ||
+                  !selectedDef ||
+                  (selectedDef && !finalValueForSubmission) ||
+                  uploading ||
+                  fetcher.state === "submitting" ||
+                  fetcher.state === "loading"
+                }
                 style={{
                   backgroundColor: "#16a34a",
                   color: "white",

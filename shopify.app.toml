@@ -3,7 +3,7 @@
 client_id = "acf943cbc8ac6bb4a9fc21583d9fd292"
 name = "Content-Builder"
 handle = "content-builder"
-application_url = "https://homepage-beneficial-mailto-argue.trycloudflare.com"
+application_url = "https://ba-ma-rings-von.trycloudflare.com"
 embedded = true
 
 [build]
@@ -27,9 +27,9 @@ scopes = "write_products,read_products, read_content, read_themes, read_inventor
 
 [auth]
 redirect_urls = [
-  "https://homepage-beneficial-mailto-argue.trycloudflare.com/auth/callback",
-  "https://homepage-beneficial-mailto-argue.trycloudflare.com/auth/shopify/callback",
-  "https://homepage-beneficial-mailto-argue.trycloudflare.com/api/auth/callback"
+  "https://ba-ma-rings-von.trycloudflare.com/auth/callback",
+  "https://ba-ma-rings-von.trycloudflare.com/auth/shopify/callback",
+  "https://ba-ma-rings-von.trycloudflare.com/api/auth/callback"
 ]
 
 [pos]
