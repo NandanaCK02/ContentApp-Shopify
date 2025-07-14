@@ -342,6 +342,9 @@ export default function ProductMetafieldEditor() {
   const [listValues, setListValues] = useState([""]);
   const [uploading, setUploading] = useState(false);
 
+  // NEW: Track if the metafield already exists
+  const [metafieldExists, setMetafieldExists] = useState(false);
+
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.intent === "updateMetafield") {
       setProductSearch("");
@@ -350,6 +353,7 @@ export default function ProductMetafieldEditor() {
       setValue("");
       setListValues([""]);
       setUploading(false);
+      setMetafieldExists(false);
     }
   }, [fetcher.data]);
 
@@ -374,6 +378,7 @@ export default function ProductMetafieldEditor() {
       setSelectedDef("");
       setValue("");
       setListValues([""]);
+      setMetafieldExists(false);
     },
     [productOptions]
   );
@@ -409,6 +414,7 @@ export default function ProductMetafieldEditor() {
   useEffect(() => {
     if (fetcher.data?.success && fetcher.data?.intent === "getMetafieldValue") {
       const fetchedValue = fetcher.data.value;
+      setMetafieldExists(fetchedValue !== null && fetchedValue !== undefined && fetchedValue !== "");
       const fetchedOriginalType = fetcher.data.originalType;
 
       if (fetchedValue !== null && fetchedValue !== undefined) {
@@ -542,6 +548,7 @@ export default function ProductMetafieldEditor() {
                     setSelectedDef(value);
                     setValue("");
                     setListValues([""]);
+                    setMetafieldExists(false);
                   }}
                   value={selectedDef}
                   placeholder="Select a metafield definition"
@@ -669,7 +676,7 @@ export default function ProductMetafieldEditor() {
                 )}
               </div>
 
-              {/* Save Button */}
+              {/* Save/Update Button */}
               <Button
                 submit
                 primary
@@ -683,13 +690,13 @@ export default function ProductMetafieldEditor() {
                   fetcher.state === "loading"
                 }
                 style={{
-                  backgroundColor: "#16a34a",
+                  backgroundColor: metafieldExists ? "#eab308" : "#16a34a", // yellow for update, green for save
                   color: "white",
                   padding: "10px 20px",
                   borderRadius: "6px",
                 }}
               >
-                Save Metafield
+                {metafieldExists ? "Update Metafield" : "Save Metafield"}
               </Button>
 
               {/* Success Message */}

@@ -11,11 +11,10 @@ import {
   TextField,
   Tabs,
   Card,
-  Thumbnail,
   Text,
   Button,
 } from "@shopify/polaris";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef } from "react";
 import { authenticate } from "../shopify.server";
 
 const { json } = remixNode;
@@ -53,6 +52,7 @@ export const loader = async ({ request }) => {
             ... on GenericFile {
               originalFileSize
               mimeType
+              url
             }
           }
         }
@@ -69,7 +69,14 @@ export const loader = async ({ request }) => {
       if (typeParam === "ALL") return true;
       if (typeParam === "IMAGE") return file.image?.url;
       if (typeParam === "VIDEO") return file.sources?.[0]?.url;
-      if (typeParam === "DOCUMENT") return file.mimeType || file.originalFileSize;
+      if (typeParam === "DOCUMENT") {
+        // Consider as document if it's a GenericFile with a mimeType (not image/video)
+        return (
+          file.mimeType &&
+          !file.image?.url &&
+          !file.sources?.[0]?.url
+        );
+      }
       return true;
     });
 
@@ -177,17 +184,24 @@ export default function MediaPage() {
               marginTop: "1.5rem",
               display: "grid",
               gap: "1rem",
-              gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))",
+              gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
             }}
           >
             {files.length === 0 ? (
               <Text>No files found.</Text>
             ) : (
               files.map((node) => {
+                const isImage = node.image?.url;
+                const isVideo = node.sources?.[0]?.url;
+                const isDocument =
+                  node.mimeType &&
+                  !isImage &&
+                  !isVideo;
+
                 return (
                   <Card key={node.id} sectioned>
                     <div style={{ padding: "0.5rem" }}>
-                      {node.image?.url && (
+                      {isImage && (
                         <img
                           src={node.image.url}
                           alt={node.alt || "Image"}
@@ -199,13 +213,44 @@ export default function MediaPage() {
                           }}
                         />
                       )}
-                      {node.sources?.[0]?.url && (
-                        <Text variant="bodySm" fontWeight="medium">🎬 Video</Text>
+                      {isVideo && (
+                        <div style={{ marginBottom: "0.5rem" }}>
+                          <video
+                            src={node.sources[0].url}
+                            controls
+                            style={{
+                              width: "100%",
+                              borderRadius: "8px",
+                              background: "#000",
+                            }}
+                          />
+                        </div>
+                      )}
+                      {isDocument && (
+                        <div style={{ marginBottom: "0.5rem", textAlign: "center" }}>
+                          <span role="img" aria-label="Document" style={{ fontSize: 40 }}>
+                            📄
+                          </span>
+                          <br />
+                          <a
+                            href={node.url || "#"}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ fontSize: 12, wordBreak: "break-all" }}
+                          >
+                            Open
+                          </a>
+                        </div>
                       )}
                       <Text variant="bodySm" fontWeight="medium" truncate>
                         {node.alt || "Untitled File"}
                       </Text>
-                      <Button size="slim" destructive onClick={() => handleDelete(node.id)}>
+                      <Button
+                        size="slim"
+                        destructive
+                        onClick={() => handleDelete(node.id)}
+                        style={{ marginTop: "0.5rem" }}
+                      >
                         Delete
                       </Button>
                     </div>
