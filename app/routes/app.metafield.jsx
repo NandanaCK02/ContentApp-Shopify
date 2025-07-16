@@ -419,8 +419,50 @@ export async function action({ request }) {
     }
   }
 
+  // ─────────────────────────────────────────
+// NEW ► CLEAR METAFIELD VALUE (scalar types)
+// ─────────────────────────────────────────
+if (intent === "clearMetafield") {
+  const productId  = form.get("productId");
+  const definition = form.get("definition"); // "namespace___key"
+  if (!productId || !definition) {
+    return json({
+      success: false,
+      errors: [{ message: "Product ID and definition required." }],
+      intent
+    }, { status: 400 });
+  }
+
+  const [namespace, key] = definition.split("___");
+
+  // 🔄 Use ownerId + namespace + key instead of ID
+  const delRes = await admin.graphql(`
+    mutation ($metafields: [MetafieldIdentifierInput!]!) {
+      metafieldsDelete(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `, {
+    variables: {
+      metafields: [{ ownerId: productId, namespace, key }]
+    }
+  });
+
+  const delData = await delRes.json();
+  const errs = delData?.data?.metafieldsDelete?.userErrors || [];
+
+  if (errs.length) {
+    return json({ success: false, errors: errs, intent, productId });
+  }
+
+  return json({ success: true, intent, productId });
+}
+
   return json({ success: false, errors: [{ message: "Invalid action intent." }] });
 }
+
+
+
 
 export default function ProductMetafieldEditor() {
   const { products, definitions } = useLoaderData();
@@ -694,6 +736,17 @@ const handleBulkSubmit = (e) => {
     );
   };
 
+  const handleRowClear = (productId) => {
+    fetcher.submit(
+      {
+        intent: "clearMetafield",
+        productId,
+        definition: selectedDef,      // "namespace___key"
+      },
+      { method: "post", action: "." }
+    );
+  };
+
   // Success/error feedback per row
   useEffect(() => {
     if (fetcher.data?.intent === "updateMetafieldsBulk" && fetcher.data?.results) {
@@ -709,11 +762,26 @@ const handleBulkSubmit = (e) => {
       if (fetcher.data.success) setSuccessMap((prev) => ({ ...prev, [fetcher.data.productId]: true }));
       else setErrorMap((prev) => ({ ...prev, [fetcher.data.productId]: fetcher.data.errors?.map(x => x.message).join(", ") || "Error" }));
     }
+
+        if (fetcher.data?.intent === "clearMetafield" && fetcher.data?.productId) {
+      const pid = fetcher.data.productId;
+      if (fetcher.data.success) {
+        setMetafieldValues(prev => ({ ...prev, [pid]: "" }));
+        setListValues(prev => ({ ...prev, [pid]: [""] }));
+        setSuccessMap(prev => ({ ...prev, [pid]: true }));
+        setErrorMap(prev => ({ ...prev, [pid]: undefined }));
+      } else {
+        setErrorMap(prev => ({
+          ...prev,
+          [pid]: fetcher.data.errors?.map(e => e.message).join(", ") || "Error",
+        }));
+      }
+    }
   }, [fetcher.data]);
 
   // UI
   return (
-    <Page title="✏️ Bulk Update Product Metafield Value">
+    <Page title="🚧 Metafield Workbench">
       <Layout>
         <Layout.Section>
           <Card sectioned spacing="loose">
@@ -864,7 +932,7 @@ const handleBulkSubmit = (e) => {
                         onClick={() => setBulkListValue([...bulkListValue, ""])}
                         style={{
                           background: "linear-gradient(90deg, #fde68a 0%, #fbbf24 100%)",
-                          color: "#b45309",
+                          color: "#eb9553ff",
                           border: "none",
                           padding: "6px 12px",
                           borderRadius: "4px",
@@ -1029,12 +1097,22 @@ const handleBulkSubmit = (e) => {
                                 />
                               )}
                             </td>
-                            <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            <td style={{ padding: "8px", verticalAlign: "top", }}>
                               <Button
                                 onClick={e => { e.preventDefault(); handleRowUpdate(pid); }}
                                 size="slim"
                                 disabled={uploading}
                               >Update</Button>
+                              <Button  /* ← paste here */
+                                destructive
+                                size="slim"
+                                onClick={e => { e.preventDefault(); handleRowClear(pid); }}
+                                disabled={uploading}
+                                style={{ marginLeft: "6px" }}
+>
+                                Clear Values
+                              </Button>
+
                             </td>
                             <td style={{ padding: "8px", verticalAlign: "top" }}>
                               {successMap[pid] && (

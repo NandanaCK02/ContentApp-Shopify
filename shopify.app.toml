@@ -3,7 +3,7 @@
 client_id = "acf943cbc8ac6bb4a9fc21583d9fd292"
 name = "Content-Builder"
 handle = "content-builder"
-application_url = "https://referral-club-emission-remember.trycloudflare.com"
+application_url = "https://nutrition-writing-peer-latina.trycloudflare.com"
 embedded = true
 
 [build]
@@ -26,7 +26,7 @@ api_version = "2025-04"
 scopes = "write_products,read_products, read_content, read_themes, read_inventory, read_product_listings,write_files"
 
 [auth]
-redirect_urls = ["https://referral-club-emission-remember.trycloudflare.com/auth/callback", "https://referral-club-emission-remember.trycloudflare.com/auth/shopify/callback", "https://referral-club-emission-remember.trycloudflare.com/api/auth/callback"]
+redirect_urls = ["https://nutrition-writing-peer-latina.trycloudflare.com/auth/callback", "https://nutrition-writing-peer-latina.trycloudflare.com/auth/shopify/callback", "https://nutrition-writing-peer-latina.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false
