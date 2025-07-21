@@ -37,6 +37,7 @@ const contentLinks = [
   { to: "/app/content/table", label: "Tables" },
   { to: "/app/content/richdescription", label: "Rich Description" },
   { to: "/app/content/faq", label: "FAQ Section" },
+  { to: "/app/content/settings", label: "Settings" },
 ];
 
 export default function ContentBuilderLayout() {

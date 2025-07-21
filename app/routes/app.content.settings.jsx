@@ -30,7 +30,7 @@ export default function GeneralSettingsPage() {
   return (
     <div style={{ padding: "2rem", maxWidth: "640px", margin: "0 auto" }}>
       <h1 style={{ fontSize: "24px", fontWeight: "600", marginBottom: "1.5rem" }}>
-        App Settings
+        Content Settings
       </h1>
 
       <Form method="post">
@@ -42,7 +42,7 @@ export default function GeneralSettingsPage() {
           <select
             name="defaultContentType"
             defaultValue={data.defaultContentType}
-            style={{ padding: "10px", width: "100%", fontSize: "16px" }}
+            style={{ padding: "10px", width: "100%", fontSize: "14px" }}
           >
             <option value="faq">FAQ</option>
             <option value="table">Table</option>
@@ -60,7 +60,7 @@ export default function GeneralSettingsPage() {
           <select
             name="blockPosition"
             defaultValue={data.blockPosition}
-            style={{ padding: "10px", width: "100%", fontSize: "16px" }}
+            style={{ padding: "10px", width: "100%", fontSize: "14px" }}
           >
             <option value="above">Above Product Description</option>
             <option value="below">Below Product Description</option>
@@ -69,7 +69,7 @@ export default function GeneralSettingsPage() {
 
         {/* Auto Publish */}
         <div style={{ marginBottom: "1.5rem" }}>
-          <label style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "16px" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "14px" }}>
             <input
               type="checkbox"
               name="autoPublish"

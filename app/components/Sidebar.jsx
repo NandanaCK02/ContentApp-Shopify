@@ -6,7 +6,8 @@ const links = [
   { to: "/app/metafield", label: "Metafield Editor" },
   { to: "/app/media", label: " Media" }, 
   { to: "/app/faq", label: " FAQ-Manager" },
-  { to: "/app/settings", label: " Settings" }
+  { to: "/app/collection", label: " Collections" },
+  
 ];
 
 
