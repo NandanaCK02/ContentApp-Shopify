@@ -139,7 +139,21 @@ export async function action({ request }) {
     if (!file || typeof file !== "object") {
       return json({ success: false, error: "No file uploaded" }, { status: 400 });
     }
-    const { admin } = await authenticate.admin(request);
+    let admin;
+try {
+  const authResult = await authenticate.admin(request);
+
+  if (!authResult || !authResult.admin) {
+    console.error("Authentication failed: No admin session returned.");
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  admin = authResult.admin;
+} catch (err) {
+  console.error("Authentication error during file upload/action:", err);
+  return new Response("Unauthorized - error in authenticate.admin", { status: 401 });
+}
+
 
     // 1. Get staged upload target
     const stagedUploadRes = await admin.graphql(`
@@ -689,6 +703,7 @@ export default function ProductMetafieldEditor() {
 
   // NEW: Metafield Definition Creation State
   const [showCreateModal, setShowCreateModal] = useState(false);
+  
 
   // AUTOCOMPLETE MULTI for Products
   const productOptions = useMemo(
@@ -712,24 +727,36 @@ export default function ProductMetafieldEditor() {
   }, [productSearch, productOptions, selectedProductIds]);
 
   // DEFINITION options (now using Polaris Select)
-  const definitionOptions = useMemo(() => {
-    // Convert definition objects from loader to { label, value } for Polaris Select
-    const opts = definitions.map((def) => ({
-      label: `${def.name} (${def.namespace}.${def.key}) - ${def.type.replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase())}`, // Friendly type name
-      value: `${def.namespace}___${def.key}___${def.originalType}`, // Store originalType for action
-      type: def.type, // Friendly type
-      originalType: def.originalType, // Shopify API type
-    }));
-    // Add a placeholder option at the beginning
-    return [{ label: "Select a metafield definition", value: "", disabled: true }, ...opts];
-  }, [definitions]);
+ // 🔹 1. Memoize the raw definition options
+const definitionOptions = useMemo(() => {
+  const opts = definitions.map((def) => ({
+    label: `${def.name} (${def.namespace}.${def.key}) - ${def.type.replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase())}`,
+    value: `${def.namespace}___${def.key}___${def.originalType}`,
+    type: def.type,
+    originalType: def.originalType,
+  }));
+  return [{ label: "Select a metafield definition", value: "", disabled: true }, ...opts];
+}, [definitions]);
 
-  const selectedDefObj = definitionOptions.find((d) => d.value === selectedDef);
-  const selectedType = selectedDefObj?.type || ""; // Friendly type
-  const selectedOriginalType = selectedDefObj?.originalType || ""; // Shopify API type
-  const isListType = selectedType.startsWith("list.");
-  const isJsonType = selectedType === "json";
-  const isFileType = selectedType === "file_reference"; // For file uploads
+
+// 🔹 2. Create search state and filtered options outside of useMemo
+const [defSearch, setDefSearch] = useState("");
+
+const filteredDefs = useMemo(() => {
+  return definitionOptions.filter(def =>
+    def.label.toLowerCase().includes(defSearch.toLowerCase())
+  );
+}, [definitionOptions, defSearch]);
+
+
+// 🔹 3. Extract selected definition type
+const selectedDefObj = definitionOptions.find((d) => d.value === selectedDef);
+const selectedType = selectedDefObj?.type || "";
+const selectedOriginalType = selectedDefObj?.originalType || "";
+const isListType = selectedType.startsWith("list.");
+const isJsonType = selectedType === "json";
+const isFileType = selectedType === "file_reference";
+
 
 
   // FETCH VALUES WHEN SELECTION CHANGES
@@ -1062,7 +1089,7 @@ export default function ProductMetafieldEditor() {
         // This is not ideal for large numbers of definitions, but works for now.
         // A better approach would be to add the new definition to the 'definitions' state directly.
         // As remix loader doesn't re-run on action, for simplicity, we'll suggest a full reload for now.
-        window.location.reload(); // Simple but effective refresh
+         // Simple but effective refresh
         // Alternatively, if you want to avoid full reload:
         // setDefinitions(prev => [...prev, definitionFetcher.data.definition]);
       } else {
@@ -1070,6 +1097,18 @@ export default function ProductMetafieldEditor() {
       }
     }
   }, [definitionFetcher.data]);
+
+  useEffect(() => {
+  if (selectedDef) {
+    const selectedObj = definitionOptions.find(d => d.value === selectedDef);
+    if (selectedObj) {
+      setDefSearch(selectedObj.label);
+    }
+  } else {
+    setDefSearch(""); // or keep empty when none selected
+  }
+}, [selectedDef, definitionOptions]);
+
 
 
   // UI
@@ -1135,33 +1174,48 @@ export default function ProductMetafieldEditor() {
                       label="Search Products"
                       value={productSearch}
                       onChange={setProductSearch}
-                      placeholder="Start typing a product name or 'all'"
+                      placeholder="Search Product Name"
                       autoComplete="off"
                     />
                   }
                 />
               </div>
               {/* Definition Dropdown */}
-              <div style={{ marginBottom: "1.5rem", display: 'flex', alignItems: 'flex-end', gap: '1rem' }}>
-                <div style={{ flexGrow: 1 }}>
-                  <Select
-                    label="Metafield Definition"
-                    options={definitionOptions}
-                    onChange={(value) => {
-                      setSelectedDef(value);
-                      setMetafieldValues({});
-                      setListValues({});
-                      setSuccessMap({});
-                      setErrorMap({});
-                    }}
-                    value={selectedDef}
-                    placeholder="Select a metafield definition"
-                  />
-                </div>
-                <Button onClick={() => setShowCreateModal(true)}>
-                  Create New Definition
-                </Button>
-              </div>
+              {/* Definition Dropdown with Search */}
+<div style={{ marginBottom: "1.5rem", display: 'flex', alignItems: 'flex-end', gap: '1rem' }}>
+  <div style={{ flexGrow: 1 }}>
+    <Autocomplete
+  options={filteredDefs}
+  selected={selectedDef ? [selectedDef] : []}  // must be array with selectedDef string
+  onSelect={(selected) => {
+    setSelectedDef(selected[0] || "");
+    setDefSearch("");
+    // Clear related states as needed
+    setMetafieldValues({});
+    setListValues({});
+    setSuccessMap({});
+    setErrorMap({});
+  }}
+  textField={
+    <Autocomplete.TextField
+  label="Metafield Definition"
+  value={defSearch}
+  onChange={setDefSearch}
+  placeholder="Search metafield definitions"
+  clearButton
+  onClearButtonClick={() => setDefSearch("")}
+  autoComplete="off"
+/>
+
+  }
+/>
+
+  </div>
+  <Button onClick={() => setShowCreateModal(true)}>
+    Create New Definition
+  </Button>
+</div>
+
               {/* Bulk Set */}
               {selectedProductIds.length > 1 && selectedDef && (
                 <div style={{ marginBottom: "1.5rem" }}>
