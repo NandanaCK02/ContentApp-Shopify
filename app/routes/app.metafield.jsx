@@ -46,11 +46,12 @@ const typeMap = {
   CUSTOMER_REFERENCE: "customer_reference",
   COMPANY_REFERENCE: "company_reference",
   METAOBJECT_REFERENCE: "metaobject_reference",
-  MIXED_REFERENCE: "mixed_reference",
-  "LIST.STRING": "list.single_line_text_field",
-  "LIST.INTEGER": "list.number_integer",
-  "LIST.BOOLEAN": "list.boolean",
-  "LIST.JSON": "list.json",
+  mixed_reference: "mixed_reference",
+  "list.single_line_text_field": "list.single_line_text_field",
+  "list.number_integer": "list.number_integer",
+  "list.boolean": "list.boolean",
+  "list.json": "list.json",
+  "list.collection_reference": "list.collection_reference",
 };
 
 // Reverse Type Map for displaying original types
