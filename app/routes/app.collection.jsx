@@ -1,835 +1,966 @@
-import { json } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
-import { authenticate } from "../shopify.server";
+// app/routes/collections.jsx
+
+import { json, unstable_parseMultipartFormData, unstable_createMemoryUploadHandler } from "@remix-run/node";
 import {
-  Page, Layout, Card, Autocomplete, TextField, Button, Text
+  Form,
+  useActionData,
+  useLoaderData,
+  useNavigation,
+  useFetcher,
+} from "@remix-run/react";
+import {
+  Page,
+  Layout,
+  Card,
+  Button,
+  LegacyStack,
+  Text,
+  DropZone,
+  DataTable,
+  Frame,
+  Toast,
+  Link,
+  List,
+  Spinner,
 } from "@shopify/polaris";
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { TitleBar } from "@shopify/app-bridge-react";
+import { useState, useCallback, useEffect } from "react";
+import { authenticate } from "../shopify.server";
+import ExcelJS from "exceljs";
+import { useRevalidator } from "@remix-run/react";
 
-// === METAFIELD TYPE MAPS ===
-const typeMap = {
-  single_line_text_field: "single_line_text_field",
-  multi_line_text_field: "multi_line_text_field",
-  rich_text_field: "rich_text_field",
-  number_integer: "number_integer",
-  number_decimal: "number_decimal",
-  boolean: "boolean",
-  json: "json",
-  date: "date",
-  date_time: "date_time",
-  money: "money",
-  url: "url",
-  color: "color",
-  rating: "rating",
-  dimension: "dimension",
-  volume: "volume",
-  weight: "weight",
-  product_reference: "product_reference",
-  variant_reference: "variant_reference",
-  collection_reference: "collection_reference",
-  file_reference: "file_reference",
-  page_reference: "page_reference",
-  customer_reference: "customer_reference",
-  company_reference: "company_reference",
-  metaobject_reference: "metaobject_reference",
-  mixed_reference: "mixed_reference",
-  "list.single_line_text_field": "list.single_line_text_field",
-  "list.number_integer": "list.number_integer",
-  "list.boolean": "list.boolean",
-  "list.json": "list.json",
-  "list.collection_reference": "list.collection_reference",
-};
-
-// === LOADER ===
-export async function loader({ request }) {
-  const { admin } = await authenticate.admin(request);
-
-  // Fetch all collections
-  let collections = [];
-  let collectionCursor = null;
-  let hasNextPage = true;
-  while (hasNextPage) {
-    const res = await admin.graphql(`
-      {
-        collections(first: 100${collectionCursor ? `, after: "${collectionCursor}"` : ""}) {
-          edges { cursor node { id title } }
-          pageInfo { hasNextPage }
-        }
-      }
-    `);
-    const data = await res.json();
-    const edges = data?.data?.collections?.edges || [];
-    collections.push(...edges.map(e => e.node));
-    hasNextPage = data?.data?.collections?.pageInfo?.hasNextPage;
-    if (hasNextPage) collectionCursor = edges[edges.length - 1].cursor;
+// --- Helper functions for validation (defined once at the top) ---
+function isValidJson(str) {
+  try {
+    JSON.parse(str);
+  } catch (e) {
+    return false;
   }
-
-  // Fetch metafield definitions for collections
-  let definitions = [];
-  let defCursor = null;
-  hasNextPage = true;
-  while (hasNextPage) {
-    const res = await admin.graphql(`
-      {
-        metafieldDefinitions(first: 100, ownerType: COLLECTION${defCursor ? `, after: "${defCursor}"` : ""}) {
-          edges {
-            cursor
-            node {
-              name
-              namespace
-              key
-              type { name }
-              id
-            }
-          }
-          pageInfo { hasNextPage }
-        }
-      }
-    `);
-    const data = await res.json();
-    const edges = data?.data?.metafieldDefinitions?.edges || [];
-    definitions.push(...edges.map(e => ({
-      ...e.node,
-      type: typeMap[e.node.type.name] || e.node.type.name,
-      originalType: e.node.type.name,
-    })));
-    hasNextPage = data?.data?.metafieldDefinitions?.pageInfo?.hasNextPage;
-    if (hasNextPage) defCursor = edges[edges.length - 1].cursor;
-  }
-
-  return json({ collections, definitions });
+  return true;
 }
 
-// === ACTION ===
-export async function action({ request }) {
-  const { admin } = await authenticate.admin(request);
-  const form = await request.formData();
-  const intent = form.get("intent");
+function isValidUrl(str) {
+  try {
+    new URL(str);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
-  // --- BULK GET ---
-  if (intent === "getMetafieldValuesBulk") {
-    const definition = form.get("definition");
-    const collectionIds = JSON.parse(form.get("collectionIds") || "[]");
-    if (!definition || !Array.isArray(collectionIds) || collectionIds.length === 0) {
-      return json({ success: false, errors: [{ message: "Definition and at least one collection required." }], intent });
-    }
-    const [namespace, key, originalType] = definition.split("___");
-    const results = await Promise.all(collectionIds.map(async (collectionId) => {
-      try {
-        const res = await admin.graphql(`
-          query getMetafield($ownerId: ID!, $namespace: String!, $key: String!) {
-            node(id: $ownerId) {
-              ... on Collection {
-                metafield(namespace: $namespace, key: $key) {
-                  value
-                }
-              }
-            }
+// --- GraphQL Queries and Mutations ---
+
+const GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY = `
+  query getCollections($cursor: String) {
+    collections(first: 250, after: $cursor) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        handle
+        title
+        descriptionHtml
+        sortOrder
+        templateSuffix
+        updatedAt
+        image { src }
+        metafields(first: 250) {
+          nodes {
+            id
+            namespace
+            key
+            value
+            type
           }
-        `, { variables: { ownerId: collectionId, namespace, key } });
-        const data = await res.json();
-        const value = data?.data?.node?.metafield?.value;
-        return { collectionId, value };
-      } catch (err) {
-        return { collectionId, value: null };
+        }
+        ruleSet {
+          appliedDisjunctively
+          rules {
+            column
+            relation
+            condition
+          }
+        }
       }
-    }));
-    const values = {};
-    for (const { collectionId, value } of results)
-      values[collectionId] = value;
-    return json({ success: true, values, originalType, intent });
+    }
+  }
+`;
+
+const COLLECTION_MUTATION = `
+  mutation collectionMutate($input: CollectionInput!) {
+    collectionUpdate(input: $input) {
+      collection {
+        id
+        title
+        ruleSet {
+          appliedDisjunctively
+          rules {
+            column
+            relation
+            condition
+          }
+        }
+      }
+      userErrors { field message }
+    }
+    collectionCreate(input: $input) {
+      collection {
+        id
+        title
+        ruleSet {
+          appliedDisjunctively
+          rules {
+            column
+            relation
+            condition
+          }
+        }
+      }
+      userErrors { field message }
+    }
+  }
+`;
+
+
+const SET_METAFIELDS_MUTATION = `
+  mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      metafields {
+        id
+        namespace
+        key
+        value
+        type
+      }
+      userErrors { field message }
+    }
+  }
+`;
+
+const GET_COLLECTION_TITLES_QUERY = `
+  query getCollectionTitles($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Collection {
+        id
+        title
+      }
+    }
+  }
+`;
+
+// --- Loader ---
+
+export const loader = async ({ request }) => {
+  const { session, admin } = await authenticate.admin(request);
+
+  if (!session || !admin) {
+    throw new Response("Unauthorized", { status: 401 });
   }
 
-  // --- BULK SET ---
-  if (intent === "updateMetafieldsBulk") {
-    const definition = form.get("definition");
-    const updates = JSON.parse(form.get("updates") || "[]");
-    if (!definition || !Array.isArray(updates) || updates.length === 0) {
-      return json({ success: false, errors: [{ message: "Definition and at least one update required." }], intent });
-    }
-    const [namespace, key, originalType] = definition.split("___");
-    const mutation = `
-      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          metafields { key namespace value }
-          userErrors { field message }
-        }
-      }
-    `;
-    const results = await Promise.all(updates.map(async ({ collectionId, value }) => {
-      if (!collectionId) return { collectionId, success: false, errors: [{ message: "Missing collectionId" }] };
-      try {
-        const variables = {
-          metafields: [
-            {
-              ownerId: collectionId,
-              namespace,
-              key,
-              type: originalType,
-              value,
-            },
-          ],
-        };
-        const response = await admin.graphql(mutation, { variables });
-        const result = await response.json();
-        const userErrors = result?.data?.metafieldsSet?.userErrors || [];
-        if (userErrors.length > 0) {
-          return { collectionId, success: false, errors: userErrors };
-        }
-        return { collectionId, success: true };
-      } catch (err) {
-        return { collectionId, success: false, errors: [{ message: "Server error" }] };
-      }
-    }));
-    const allSuccess = results.every(r => r.success);
-    return json({ success: allSuccess, results, intent });
-  }
+  let collections = [];
+  let cursor = null;
+  let hasNextPage = true;
 
-  // --- SINGLE ROW UPDATE ---
-  if (intent === "updateMetafield") {
-    const collectionId = form.get("collectionId");
-    const definition = form.get("definition");
-    const value = form.get("value");
-    if (!collectionId || !definition || value === null) {
-      return json({ success: false, errors: [{ message: "Collection ID, definition, and value are required." }], intent: "updateMetafield" });
-    }
-    const [namespace, key, originalType] = definition.split("___");
-    const mutation = `
-      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          metafields { key namespace value }
-          userErrors { field message }
-        }
+  // Store key -> { type, namespace } for metafield definitions found in existing collections
+  const allMetafieldDefinitions = new Map();
+
+  try {
+    while (hasNextPage) {
+      const response = await admin.graphql(GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY, {
+        variables: { cursor },
+      });
+      const data = await response.json();
+
+      if (data.errors) {
+        console.error("GraphQL loader errors (GET_ALL_COLLECTIONS_WITH_METAFIELDS):", JSON.stringify(data.errors, null, 2));
+        throw new Error(`Failed to fetch collections: ${data.errors.map(e => e.message).join(", ")}`);
       }
-    `;
-    const variables = { metafields: [{
-      ownerId: collectionId, namespace, key, type: originalType, value
-    }]};
-    try {
-      const response = await admin.graphql(mutation, { variables });
-      const result = await response.json();
-      const userErrors = result?.data?.metafieldsSet?.userErrors || [];
-      if (userErrors.length > 0) {
-        return json({ success: false, errors: userErrors, intent: "updateMetafield", collectionId });
-      }
-      return json({ success: true, intent: "updateMetafield", collectionId });
-    } catch (err) {
-      return json({
-        success: false,
-        errors: [{ message: "Server error during metafield update." }],
-        intent: "updateMetafield",
-        collectionId,
+
+      const result = data.data.collections;
+
+      collections.push(...result.nodes);
+      hasNextPage = result.pageInfo.hasNextPage;
+      cursor = result.pageInfo.endCursor;
+
+      result.nodes.forEach(collection => {
+        collection.metafields.nodes.forEach(mf => {
+          if (!allMetafieldDefinitions.has(mf.key)) {
+            // Store both type and namespace
+            allMetafieldDefinitions.set(mf.key, { type: mf.type, namespace: mf.namespace });
+          }
+        });
       });
     }
-  }
 
-  // --- SINGLE CLEAR ---
-  if (intent === "clearMetafield") {
-    const collectionId = form.get("collectionId");
-    const definition = form.get("definition");
-    if (!collectionId || !definition) {
-      return json({
-        success: false,
-        errors: [{ message: "Collection ID and definition required." }],
-        intent
-      }, { status: 400 });
-    }
-    const [namespace, key] = definition.split("___");
-    const delRes = await admin.graphql(`
-      mutation ($metafields: [MetafieldIdentifierInput!]!) {
-        metafieldsDelete(metafields: $metafields) {
-          userErrors { field message }
-        }
-      }
-    `, { variables: { metafields: [{ ownerId: collectionId, namespace, key }] } });
-    const delData = await delRes.json();
-    const errs = delData?.data?.metafieldsDelete?.userErrors || [];
-    if (errs.length)
-      return json({ success: false, errors: errs, intent, collectionId });
-    return json({ success: true, intent, collectionId });
-  }
+    // Resolve GIDs in metafield values to names for display in the UI and prepare for export
+    for (const collection of collections) {
+      // Determine collection type (Smart/Manual)
+      collection.type = collection.ruleSet ? "Smart" : "Manual";
 
-  return json({ success: false, errors: [{ message: "Invalid action intent." }] });
-}
+      // Prepare rules for export/display
+      collection.exportedRules = collection.ruleSet?.rules || [];
 
-// === CLIENT/UI COMPONENT ===
-export default function CollectionMetafieldEditor() {
-  const { collections, definitions } = useLoaderData();
-  const fetcher = useFetcher();
-  const [collectionSearch, setCollectionSearch] = useState("");
-  const [selectedCollectionIds, setSelectedCollectionIds] = useState([]);
-  const [selectedDef, setSelectedDef] = useState("");
-  const [metafieldValues, setMetafieldValues] = useState({});
-  const [listValues, setListValues] = useState({});
-  const [bulkValue, setBulkValue] = useState("");
-  const [bulkListValue, setBulkListValue] = useState([]);
-  const [successMap, setSuccessMap] = useState({});
-  const [errorMap, setErrorMap] = useState({});
 
-  const definitionOptions = useMemo(() => [{
-    label: "Select a metafield definition", value: "", disabled: true
-  }].concat(definitions.map(def => ({
-    label: `${def.name} (${def.namespace}.${def.key}) - ${def.type.replace(/_/g, ' ')}`,
-    value: `${def.namespace}___${def.key}___${def.originalType}`,
-    namespace: def.namespace,
-    key: def.key,
-    type: def.type,
-    originalType: def.originalType,
-  }))), [definitions]);
-  const [defSearch, setDefSearch] = useState("");
-  const filteredDefs = useMemo(() => {
-    return definitionOptions.filter(def =>
-      def.label.toLowerCase().includes(defSearch.toLowerCase())
-    );
-  }, [definitionOptions, defSearch]);
-  const selectedDefObj = definitionOptions.find(d => d.value === selectedDef);
-  const selectedType = selectedDefObj?.type || "";
-  const selectedOriginalType = selectedDefObj?.originalType || "";
-  const isListType = selectedType.startsWith("list.") && !["list.collection_reference"].includes(selectedType);
-  const isJsonType = selectedType === "json";
-  const isCollectionReference = selectedType === "collection_reference";
-  const isListCollectionReference = selectedType === "list.collection_reference";
-
-  const collectionOptions = useMemo(
-    () => collections.map(col => ({ label: col.title, value: col.id })),
-    [collections]
-  );
-  const filteredCollectionOptions = useMemo(() => {
-    let options = collectionOptions.filter(opt => !selectedCollectionIds.includes(opt.value));
-    return options.filter(option =>
-      option.label.toLowerCase().includes(collectionSearch.toLowerCase())
-    ).slice(0, 20);
-  }, [collectionSearch, collectionOptions, selectedCollectionIds]);
-
-  // ------- FETCH VALUES -------
-  useEffect(() => {
-    if (selectedCollectionIds.length && selectedDef) {
-      fetcher.submit(
-        {
-          intent: "getMetafieldValuesBulk",
-          collectionIds: JSON.stringify(selectedCollectionIds),
-          definition: selectedDef,
-        },
-        { method: "post", action: "." }
-      );
-    } else {
-      setMetafieldValues({});
-      setListValues({});
-      setSuccessMap({});
-      setErrorMap({});
-    }
-  }, [selectedCollectionIds, selectedDef]);
-
-  useEffect(() => {
-    if (fetcher.data?.success && fetcher.data?.intent === "getMetafieldValuesBulk") {
-      const fetched = fetcher.data.values || {};
-      const newValues = {};
-      const newListValues = {};
-      for (const cid of selectedCollectionIds) {
-        const v = fetched[cid];
-        if (isListCollectionReference) {
+      for (const metafield of collection.metafields.nodes) {
+        // Handle list.collection_reference for display (human-readable titles)
+        if (metafield.type === 'list.collection_reference' && typeof metafield.value === 'string') {
+          let gids = [];
           try {
-            const arr = JSON.parse(v);
-            newListValues[cid] = Array.isArray(arr) ? arr : [];
-            newValues[cid] = "";
-          } catch {
-            newListValues[cid] = [];
-            newValues[cid] = "";
+            const parsed = JSON.parse(metafield.value);
+            if (Array.isArray(parsed)) {
+              gids = parsed;
+            }
+          } catch (e) {
+            console.warn(`Metafield '${metafield.key}' has invalid JSON for list.collection_reference: ${metafield.value}`);
+            gids = [];
           }
-        } else if (isListType || (isJsonType && Array.isArray(v))) {
+
+          const validGids = gids.filter(gid => typeof gid === 'string' && gid.startsWith("gid://shopify/Collection/"));
+
+          if (validGids.length > 0) {
+            try {
+              const response = await admin.graphql(GET_COLLECTION_TITLES_QUERY, {
+                variables: { ids: validGids },
+              });
+              const result = await response.json();
+
+              if (result.errors) {
+                console.error("GraphQL loader (GET_COLLECTION_TITLES) errors for metafield GIDs:", JSON.stringify(result.errors, null, 2));
+                metafield.displayValue = "Error resolving references.";
+                continue;
+              }
+
+              const titleMap = {};
+              for (const node of result.data.nodes) {
+                if (node && node.id && node.title) titleMap[node.id] = node.title;
+              }
+              metafield.displayValue = validGids.map((gid) => titleMap[gid] || `[Invalid GID: ${gid}]`).join(", ");
+            } catch (error) {
+              console.error(`Error resolving GIDs for collection ${collection.id}, metafield ${metafield.key}:`, error);
+              metafield.displayValue = "Error resolving references.";
+            }
+          } else {
+            metafield.displayValue = "";
+          }
+        }
+        // Handle single collection_reference for display
+        else if (metafield.type === 'collection_reference' && typeof metafield.value === 'string' && metafield.value.startsWith("gid://shopify/Collection/")) {
           try {
-            const arr = JSON.parse(v);
-            newListValues[cid] = Array.isArray(arr) && arr.length > 0 ? arr : [""];
-            newValues[cid] = "";
-          } catch {
-            newListValues[cid] = [v];
-            newValues[cid] = "";
+            const response = await admin.graphql(GET_COLLECTION_TITLES_QUERY, {
+              variables: { ids: [metafield.value] },
+            });
+            const result = await response.json();
+            if (!result.errors && result.data?.nodes?.[0]?.title) {
+              metafield.displayValue = result.data.nodes[0].title;
+            } else {
+              metafield.displayValue = `[Invalid GID: ${metafield.value}]`;
+            }
+          } catch (error) {
+            console.error(`Error resolving single GID for collection ${collection.id}, metafield ${metafield.key}:`, error);
+            metafield.displayValue = "Error resolving reference.";
           }
         } else {
-          newValues[cid] = v || "";
-          newListValues[cid] = [];
+          metafield.displayValue = metafield.value; // For all other types, display the raw value
         }
       }
-      setMetafieldValues(newValues);
-      setListValues(newListValues);
     }
-  }, [fetcher.data, isListType, isJsonType, isListCollectionReference, selectedCollectionIds]);
+  } catch (error) {
+    console.error("Error in collections loader:", error);
+    return json({ collections: [], error: error.message || "Failed to load collections." }, { status: 500 });
+  }
+
+  return json({ collections, metafieldDefinitions: Object.fromEntries(allMetafieldDefinitions) });
+};
+
+// --- Action (Import) ---
+
+function convertValueForShopifyType(value, type) {
+  // If the value is truly empty or undefined, return null to signify "no value" or deletion
+  if (value === null || value === undefined || (typeof value === 'string' && String(value).trim() === "")) {
+    // For reference types, rich_text, and JSON, if empty, send null to clear.
+    // For boolean, default to false if explicitly empty/null (as per Shopify's typical behavior for new/empty).
+    // For other types, null effectively clears them if they exist.
+    if (type.endsWith('_reference') || type.startsWith('list.') || type === 'rich_text' || type === 'json') {
+      return null;
+    }
+    if (type === 'boolean') {
+      return false; // Default to false if no value is provided, rather than null which might not clear the field.
+    }
+    // For other string/number fields, an empty string might be desired, but if `value` is truly empty, null is safer to clear.
+    return null;
+  }
+
+  const stringValue = String(value);
+
+  switch (type) {
+    case "number_integer":
+      const intValue = parseInt(stringValue, 10);
+      return isNaN(intValue) ? null : String(intValue);
+    case "number_decimal":
+      const decimalValue = parseFloat(stringValue);
+      return isNaN(decimalValue) ? null : String(decimalValue);
+    case "boolean":
+      // Handle "Any"/"All" from export, and standard "true"/"false" or "1"/"0"
+      if (stringValue.toLowerCase() === "any") return true;
+      if (stringValue.toLowerCase() === "all") return false;
+      return stringValue.toLowerCase() === "true" || stringValue === "1" || stringValue.toLowerCase() === "yes";
+    case "json":
+    case "dimension":
+    case "volume":
+    case "weight":
+    case "rating":
+      // Value must be a string that represents valid JSON
+      try {
+        JSON.parse(stringValue);
+        return stringValue;
+      } catch (e) {
+        console.warn(`Invalid JSON format for metafield type '${type}': "${stringValue}". Returning null.`);
+        return null; // Return null if invalid JSON
+      }
+    case "rich_text":
+      // If it's already valid JSON (likely from a previous export), use it.
+      // Otherwise, assume it's plain text and convert to Shopify's rich_text JSON format.
+      try {
+        JSON.parse(stringValue);
+        return stringValue;
+      } catch (e) {
+        // Fallback for plain text: convert to rich_text JSON format
+        return JSON.stringify({
+          "blocks": [
+            {
+              "type": "paragraph",
+              "children": [
+                { "text": stringValue }
+              ]
+            }
+          ]
+        });
+      }
+    case "date":
+      // Excel dates are numbers (days since 1900-01-01). Handle both number and string formats.
+      if (typeof value === 'number') {
+        const date = new Date(Math.round((value - 25569) * 86400 * 1000)); // Convert Excel serial date to JS Date
+        return date.toISOString().split('T')[0]; // Format to YYYY-MM-DD
+      }
+      // If it's a string, attempt to parse and format
+      const dateParse = new Date(stringValue);
+      return isNaN(dateParse.getTime()) ? null : dateParse.toISOString().split('T')[0];
+    case "date_time":
+      // Excel dates are numbers. Handle both number and string formats.
+      if (typeof value === 'number') {
+        const dateTime = new Date(Math.round((value - 25569) * 86400 * 1000));
+        return dateTime.toISOString(); // Full ISO format
+      }
+      // If it's a string, attempt to parse and format
+      const dateTimeParse = new Date(stringValue);
+      return isNaN(dateTimeParse.getTime()) ? null : dateTimeParse.toISOString();
+    case "url":
+      if (!isValidUrl(stringValue)) {
+        console.warn(`Invalid URL for metafield type 'url': "${stringValue}". Returning null.`);
+        return null; // Return null for invalid URLs
+      }
+      return stringValue;
+    case "collection_reference":
+      // Expects a single GID string
+      return stringValue.startsWith("gid://shopify/Collection/") ? stringValue : null;
+    case "list.collection_reference":
+      // Expects a JSON array string of GIDs
+      try {
+        const parsed = JSON.parse(stringValue);
+        if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string' && item.startsWith("gid://shopify/Collection/"))) {
+          return JSON.stringify(parsed);
+        }
+      } catch (e) {
+        console.warn(`Invalid JSON or GID format for list.collection_reference: "${stringValue}". Returning null.`);
+      }
+      return null;
+    case "file_reference":
+    case "image_reference":
+      // Expects a single GID string
+      return stringValue.startsWith("gid://shopify/File/") || stringValue.startsWith("gid://shopify/MediaImage/") ? stringValue : null;
+    case "list.file_reference":
+    case "list.image_reference":
+      // Expects a JSON array string of GIDs
+      try {
+        const parsed = JSON.parse(stringValue);
+        if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string' && (item.startsWith("gid://shopify/File/") || item.startsWith("gid://shopify/MediaImage/")))) {
+          return JSON.stringify(parsed);
+        }
+      } catch (e) {
+        console.warn(`Invalid JSON or GID format for list.file_reference/image_reference: "${stringValue}". Returning null.`);
+      }
+      return null;
+    default:
+      return stringValue; // For generic text fields, return the string value directly
+  }
+}
+
+export const action = async ({ request }) => {
+  const { session, admin } = await authenticate.admin(request);
+  if (!session) {
+    return json({ success: false, error: "Authentication required.", status: 401 }, { status: 401 });
+  }
+
+  const uploadHandler = unstable_createMemoryUploadHandler({ maxPartSize: 50_000_000 }); // 50 MB
+  let formData;
+  try {
+    formData = await unstable_parseMultipartFormData(request, uploadHandler);
+  } catch (error) {
+    console.error("Error parsing multipart form data:", error);
+    return json({ success: false, error: "Failed to parse file upload. File might be too large or corrupted.", details: error.message }, { status: 400 });
+  }
+
+  const file = formData.get("file");
+
+  if (!file || !(file instanceof Blob)) {
+    return json({ success: false, error: "No file uploaded or invalid file type. Please upload an Excel (.xlsx) file.", status: 400 }, { status: 400 });
+  }
+
+  let workbook;
+  let worksheet;
+  let headerRowValues;
+  const collectionsData = JSON.parse(formData.get("collectionsData"));
+  // This map now holds { key: { type, namespace } } for known metafields
+  const originalMetafieldDefinitionsMap = collectionsData.metafieldDefinitions || {};
+
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
+    worksheet = workbook.worksheets[0];
+
+    if (!worksheet) {
+      return json({ success: false, error: "Excel file is empty or invalid format. No worksheet found.", status: 400 });
+    }
+
+    headerRowValues = worksheet.getRow(1).values;
+    // ExcelJS `values` returns an array where index 0 is null/undefined and actual values start from index 1.
+    // Filter out null/undefined values to get actual headers.
+    const filteredHeaderRowValues = headerRowValues.filter(h => h !== null && h !== undefined && String(h).trim() !== '');
+
+    // Expected minimal headers
+    if (!filteredHeaderRowValues || filteredHeaderRowValues.length < 7) {
+      return json({ success: false, error: "Excel file is missing expected header columns (Collection ID, Title, Description, Sort Order, Template Suffix, Collection Type, Smart Collection: Applied Disjunctively).", status: 400 });
+    }
+
+  } catch (error) {
+    console.error("Error reading Excel file:", error);
+    return json({ success: false, error: `Failed to read Excel file: ${error.message}. Ensure it's a valid .xlsx format.`, status: 400 }, { status: 400 });
+  }
+
+  let errors = [];
+  let processedRowsCount = 0;
+  let updatedCollectionsCount = 0;
+  let createdCollectionsCount = 0;
+  let updatedMetafieldsCount = 0;
+
+  // Identify column indices dynamically for robustness
+  const headerMap = new Map(); // Header Name -> Column Index (1-based from ExcelJS)
+  headerRowValues.forEach((h, idx) => {
+    if (typeof h === 'string' && h.trim() !== '') {
+      headerMap.set(h.trim(), idx);
+    }
+  });
+
+  const getCellVal = (row, header) => {
+    const colIndex = headerMap.get(header);
+    return colIndex ? row.getCell(colIndex)?.value : undefined;
+  };
+
+  for (let rowIndex = 2; rowIndex <= worksheet.rowCount; rowIndex++) {
+    const row = worksheet.getRow(rowIndex);
+    const id = String(getCellVal(row, "Collection ID") || '').trim();
+    const title = String(getCellVal(row, "Title") || '').trim();
+    const descriptionHtml = String(getCellVal(row, "Description") || '').trim();
+    const sortOrderRaw = getCellVal(row, "Sort Order");
+    const templateSuffix = String(getCellVal(row, "Template Suffix") || '').trim() || null;
+    const collectionType = String(getCellVal(row, "Collection Type") || '').trim().toLowerCase();
+    const appliedDisjunctivelyRaw = getCellVal(row, "Smart Collection: Applied Disjunctively");
+
+    // Skip row if title is empty for new collection
+    if (!id && !title) {
+      errors.push({ row: rowIndex, message: "Skipping row: Title is empty for new collection, and Collection ID is missing." });
+      continue;
+    }
+    // Validate Collection ID for updates
+    if (id && !id.startsWith("gid://shopify/Collection/")) {
+      errors.push({
+        row: rowIndex,
+        message: `Invalid Collection ID in Column 'Collection ID'. Expected format: 'gid://shopify/Collection/12345'. Found: "${id || 'EMPTY'}"`
+      });
+      continue;
+    }
+
+    const collectionInput = {
+      title,
+      descriptionHtml,
+    };
+
+    if (sortOrderRaw) {
+      const sortOrder = String(sortOrderRaw).toUpperCase().trim();
+      const validSortOrders = ['ALPHA_ASC', 'ALPHA_DESC', 'BEST_SELLING', 'CREATED', 'MANUAL', 'PRICE_ASC', 'PRICE_DESC'];
+      if (validSortOrders.includes(sortOrder)) {
+        collectionInput.sortOrder = sortOrder;
+      } else {
+        errors.push({ row: rowIndex, message: `Invalid Sort Order value: "${sortOrderRaw}". Must be one of: ${validSortOrders.join(", ")}. Skipping sortOrder update.` });
+      }
+    }
+
+    collectionInput.templateSuffix = templateSuffix;
+
+    // --- Smart Collection RuleSet Handling ---
+    if (collectionType === 'smart') {
+      const rules = [];
+      let ruleIndex = 1;
+      while (headerMap.has(`Rule ${ruleIndex} - Column`)) {
+        const column = String(getCellVal(row, `Rule ${ruleIndex} - Column`) || '').trim();
+        const relation = String(getCellVal(row, `Rule ${ruleIndex} - Relation`) || '').trim();
+        const condition = getCellVal(row, `Rule ${ruleIndex} - Condition`);
+
+        if (column && relation && condition !== undefined && String(condition).trim() !== '') {
+          rules.push({ column, relation, condition: String(condition) });
+        } else if (column || relation || (condition !== undefined && String(condition).trim() !== '')) {
+          errors.push({
+            row: rowIndex,
+            message: `Incomplete rule ${ruleIndex} for smart collection. All of 'Column', 'Relation', 'Condition' must be present and non-empty for rule ${ruleIndex}.`
+          });
+        }
+        ruleIndex++;
+      }
+
+      if (rules.length > 0) {
+        const appliedDisjunctivelyBoolean = String(appliedDisjunctivelyRaw || '').toLowerCase() === 'any';
+        collectionInput.ruleSet = {
+          appliedDisjunctively: appliedDisjunctivelyBoolean,
+          rules: rules,
+        };
+      } else {
+        errors.push({
+          row: rowIndex,
+          message: `Collection type is 'Smart' but no valid rules were found. Smart collections require at least one rule. This collection will be treated as Manual.`
+        });
+        collectionInput.ruleSet = null;
+      }
+    } else {
+      collectionInput.ruleSet = null;
+    }
+
+    // --- Perform Collection Update or Create ---
+    let mutationType = id ? "update" : "create";
+    try {
+      let mutationResponse;
+      let mutationResult;
+
+      if (mutationType === "update") {
+        const updateInput = { ...collectionInput, id: id };
+        mutationResponse = await admin.graphql(COLLECTION_MUTATION, {
+          variables: { input: updateInput },
+        });
+        mutationResult = await mutationResponse.json();
+
+        if (mutationResult.data?.collectionUpdate?.userErrors?.length > 0) {
+          errors.push({
+            row: rowIndex,
+            message: `Collection update errors: ${mutationResult.data.collectionUpdate.userErrors.map(e => `${e.field}: ${e.message}`).join("; ")}`,
+          });
+        } else if (mutationResult.errors) {
+          errors.push({
+            row: rowIndex,
+            message: `Collection update GraphQL errors: ${JSON.stringify(mutationResult.errors.map(e => e.message).join(", "))}`,
+          });
+        } else {
+          updatedCollectionsCount++;
+          // Success message can be logged if needed
+        }
+      } else { // Create
+        mutationResponse = await admin.graphql(COLLECTION_MUTATION, {
+          variables: { input: collectionInput },
+        });
+        mutationResult = await mutationResponse.json();
+
+        if (mutationResult.data?.collectionCreate?.userErrors?.length > 0) {
+          errors.push({
+            row: rowIndex,
+            message: `Collection creation errors: ${mutationResult.data.collectionCreate.userErrors.map(e => `${e.field}: ${e.message}`).join("; ")}`,
+          });
+        } else if (mutationResult.errors) {
+          errors.push({
+            row: rowIndex,
+            message: `Collection creation GraphQL errors: ${JSON.stringify(mutationResult.errors.map(e => e.message).join(", "))}`,
+          });
+        } else {
+          createdCollectionsCount++;
+          const newCollectionId = mutationResult.data.collectionCreate.collection.id;
+          if (newCollectionId) {
+            collectionInput.id = newCollectionId; // Update ID for subsequent metafield creation
+          }
+          // Success message can be logged if needed
+        }
+      }
+
+    } catch (e) {
+      console.error(`Error ${mutationType} collection ${title} (row ${rowIndex}):`, e);
+      errors.push({ row: rowIndex, message: `Collection ${mutationType} failed for "${title}": ${e.message}` });
+      continue; // Skip metafield update if collection failed to create/update
+    }
+
+
+    // --- Metafields Update ---
+    if (!collectionInput.id) {
+      errors.push({ row: rowIndex, message: `Skipping metafield updates for "${title}" as collection ID is not available.` });
+      continue;
+    }
+
+    const metafieldsToSet = [];
+    for (const [header, colIndex] of headerMap.entries()) {
+      // Skip default columns and rule columns
+      if (
+        ["Collection ID", "Title", "Description", "Sort Order", "Template Suffix", "Collection Type", "Smart Collection: Applied Disjunctively"].includes(header) ||
+        header.startsWith("Rule ")
+      ) {
+        continue;
+      }
+
+      const rawValue = row.getCell(colIndex)?.value;
+      const key = header;
+
+      // Determine the metafield's defined type and namespace
+      const existingMetafieldDef = originalMetafieldDefinitionsMap[key];
+      const shopifyDefinedType = existingMetafieldDef?.type || "single_line_text_field"; // Default to text if not found
+      const metafieldNamespace = existingMetafieldDef?.namespace || "custom"; // Use existing namespace, default to 'custom'
+
+      const valueForApi = convertValueForShopifyType(rawValue, shopifyDefinedType);
+
+      // Only add to metafieldsToSet if the value is not undefined (meaning it was processed by convertValueForShopifyType)
+      // and if it's not null (which means we want to clear/delete the value)
+      if (valueForApi !== undefined) {
+        metafieldsToSet.push({
+          ownerId: collectionInput.id,
+          namespace: metafieldNamespace, // Use the determined namespace!
+          key: key,
+          type: shopifyDefinedType,
+          value: valueForApi !== null ? String(valueForApi) : null, // Ensure value is string or null
+        });
+      }
+    }
+
+    if (metafieldsToSet.length > 0) {
+      try {
+        console.log(`Attempting to set metafields for collection ID: ${collectionInput.id} (Row ${rowIndex})`);
+        console.log("Metafields payload:", JSON.stringify(metafieldsToSet, null, 2)); // <-- CRITICAL LOG
+
+        const metafieldResponse = await admin.graphql(SET_METAFIELDS_MUTATION, {
+          variables: { metafields: metafieldsToSet },
+        });
+        const metafieldResult = await metafieldResponse.json();
+
+        if (metafieldResult.errors) {
+          console.error(`Metafield update GraphQL errors for row ${rowIndex}:`, JSON.stringify(metafieldResult.errors, null, 2)); // <-- CRITICAL LOG
+          errors.push({
+            row: rowIndex,
+            message: `Metafield update GraphQL errors: ${metafieldResult.errors.map(e => e.message).join(", ")}`
+          });
+        } else if (metafieldResult.data?.metafieldsSet?.userErrors?.length) {
+          console.error(`Metafield update user errors for row ${rowIndex}:`, JSON.stringify(metafieldResult.data.metafieldsSet.userErrors, null, 2)); // <-- CRITICAL LOG
+          errors.push({
+            row: rowIndex,
+            message: `Metafield update user errors: ${metafieldResult.data.metafieldsSet.userErrors.map(e => `${e.field}: ${e.message}`).join("; ")}`,
+          });
+        } else if (metafieldResult.data?.metafieldsSet?.metafields?.length) {
+          updatedMetafieldsCount += metafieldResult.data.metafieldsSet.metafields.length;
+          console.log(`Successfully updated ${metafieldResult.data.metafieldsSet.metafields.length} metafields for collection ${collectionInput.id}`);
+        }
+      } catch (e) {
+        console.error(`Network or unexpected error updating metafields for collection ${collectionInput.id} (row ${rowIndex}):`, e);
+        errors.push({ row: rowIndex, message: `Metafield update failed for ID ${collectionInput.id}: ${e.message}` });
+      }
+    }
+    processedRowsCount++;
+  }
+
+  let summaryMessage = `Import process completed.`;
+  let isSuccess = errors.length === 0;
+
+  if (isSuccess) {
+    summaryMessage += ` All ${processedRowsCount} rows processed. ${createdCollectionsCount} collections created and ${updatedCollectionsCount} updated. ${updatedMetafieldsCount} metafields set successfully.`;
+  } else {
+    summaryMessage += ` ${createdCollectionsCount} collections created, ${updatedCollectionsCount} updated, ${updatedMetafieldsCount} metafields set. However, ${errors.length} row(s) had errors.`;
+  }
+
+  return json({
+    success: isSuccess,
+    message: summaryMessage,
+    errors,
+    processedRowsCount,
+    updatedCollectionsCount,
+    createdCollectionsCount,
+    updatedMetafieldsCount,
+    importedFileName: file.name,
+  }, { status: isSuccess ? 200 : 400 });
+};
+
+
+export default function Collections() {
+  const { collections, error: loaderError, metafieldDefinitions } = useLoaderData();
+  const actionData = useActionData();
+  const navigation = useNavigation();
+  const fetcher = useFetcher();
+  const revalidator = useRevalidator();
+
+  const [fileName, setFileName] = useState("");
+  const [toastActive, setToastActive] = useState(false);
+  const [toastContent, setToastContent] = useState("");
+  const [toastError, setToastError] = useState(false);
+  const [importErrors, setImportErrors] = useState([]);
 
   useEffect(() => {
-    if (fetcher.data?.intent === "updateMetafieldsBulk" && fetcher.data?.results) {
-      const s = {}, e = {};
-      fetcher.data.results.forEach(r => {
-        if (r.success) s[r.collectionId] = true;
-        else e[r.collectionId] = r.errors?.map(x => x.message).join(", ") || "Error";
+    if (loaderError) {
+      setToastContent(`Error loading collections: ${loaderError}`);
+      setToastError(true);
+      setToastActive(true);
+    }
+  }, [loaderError]);
+
+  const handleDownload = useCallback(async () => {
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Collections");
+
+    const uniqueMetafields = new Map();
+    collections.forEach(col => {
+      col.metafields.nodes.forEach(mf => {
+        if (!uniqueMetafields.has(mf.key)) {
+          // Store namespace for export to ensure it's re-used on import
+          uniqueMetafields.set(mf.key, { key: mf.key, type: mf.type, namespace: mf.namespace });
+        }
       });
-      setSuccessMap(s);
-      setErrorMap(e);
-    }
-    if (fetcher.data?.intent === "updateMetafield" && fetcher.data?.collectionId) {
-      if (fetcher.data.success) setSuccessMap((prev) => ({ ...prev, [fetcher.data.collectionId]: true }));
-      else setErrorMap((prev) => ({ ...prev, [fetcher.data.collectionId]: fetcher.data.errors?.map(x => x.message).join(", ") || "Error" }));
-    }
-    if (fetcher.data?.intent === "clearMetafield" && fetcher.data?.collectionId) {
-      const cid = fetcher.data.collectionId;
-      if (fetcher.data.success) {
-        setMetafieldValues(prev => ({ ...prev, [cid]: "" }));
-        setListValues(prev => ({ ...prev, [cid]: isListCollectionReference ? [] : [""] }));
-        setSuccessMap(prev => ({ ...prev, [cid]: true }));
-        setErrorMap(prev => ({ ...prev, [cid]: undefined }));
-      } else {
-        setErrorMap(prev => ({
-          ...prev,
-          [cid]: fetcher.data.errors?.map(e => e.message).join(", ") || "Error",
-        }));
+    });
+
+    const metafieldKeysAndTypes = Array.from(uniqueMetafields.values()).sort((a, b) => a.key.localeCompare(b.key));
+    const metafieldHeaders = metafieldKeysAndTypes.map(mt => mt.key);
+
+    // Determine max number of rules for any smart collection
+    let maxRules = 0;
+    collections.forEach(col => {
+      if (col.type === "Smart" && col.exportedRules.length > maxRules) {
+        maxRules = col.exportedRules.length;
       }
+    });
+
+    const ruleHeaders = [];
+    for (let i = 1; i <= maxRules; i++) {
+      ruleHeaders.push(`Rule ${i} - Column`, `Rule ${i} - Relation`, `Rule ${i} - Condition`);
     }
-  }, [fetcher.data]);
 
-  // ---------- Handler swaps --------------
-  const handleCollectionSelect = useCallback(
-    (selected) => {
-      setSelectedCollectionIds((prev) => Array.from(new Set([...prev, ...selected])));
-      setCollectionSearch("");
-    },
-    []
-  );
-  const handleRemoveCollection = (cid) => {
-    setSelectedCollectionIds((prev) => prev.filter(id => id !== cid));
-    setMetafieldValues((prev) => {
-      const copy = { ...prev }; delete copy[cid]; return copy;
-    });
-    setListValues((prev) => {
-      const copy = { ...prev }; delete copy[cid]; return copy;
-    });
-    setSuccessMap((prev) => {
-      const copy = { ...prev }; delete copy[cid]; return copy;
-    });
-    setErrorMap((prev) => {
-      const copy = { ...prev }; delete copy[cid]; return copy;
-    });
-  };
+    const headers = [
+      "Collection ID",
+      "Title",
+      "Description",
+      "Sort Order",
+      "Template Suffix",
+      "Collection Type", // Manual or Smart
+      "Smart Collection: Applied Disjunctively", // Changed header text
+      ...ruleHeaders, // Dynamic rule headers
+      ...metafieldHeaders,
+    ];
+    worksheet.addRow(headers);
 
-  // --------- Field changes ---------
-  const handleValueChange = (collectionId, val) => {
-    setMetafieldValues((prev) => ({ ...prev, [collectionId]: val }));
-  };
-  const handleListValueChange = (collectionId, data) => {
-    setListValues((prev) => ({
-      ...prev,
-      [collectionId]: Array.isArray(data) ? data : [data]
-    }));
-  };
-  const handleAddListItem = (collectionId) => {
-    setListValues((prev) => ({
-      ...prev,
-      [collectionId]: [...(prev[collectionId] || [""]), ""],
-    }));
-  };
-  const handleRemoveListItem = (collectionId, idx) => {
-    setListValues((prev) => {
-      const arr = [...(prev[collectionId] || [""])];
-      arr.splice(idx, 1);
-      return { ...prev, [collectionId]: arr.length > 0 ? arr : [""] };
-    });
-  };
-
-  // --------- BULK SET -----------
-  const handleBulkSet = () => {
-    if (isListCollectionReference) {
-      selectedCollectionIds.forEach(cid => setListValues((prev) => ({ ...prev, [cid]: bulkListValue })));
-    } else if (isListType || (isJsonType && Array.isArray(bulkListValue))) {
-      const updatedListValues = {};
-      selectedCollectionIds.forEach(cid => {
-        const clean = bulkListValue.filter(v => v && v.trim() !== "");
-        updatedListValues[cid] = clean.length > 0 ? clean : [""];
+    collections.forEach(col => {
+      const metafieldMap = {};
+      col.metafields.nodes.forEach(mf => {
+        // When exporting, ensure the raw GID is exported for reference types.
+        // The displayValue is for UI, actual value is for re-import.
+        if (mf.type.endsWith('_reference') || mf.type.startsWith('list.')) {
+          metafieldMap[mf.key] = mf.value || ""; // Export the raw value (GID or JSON array of GIDs)
+        } else {
+          metafieldMap[mf.key] = mf.displayValue || mf.value || "";
+        }
       });
-      setListValues(updatedListValues);
-    } else {
-      const newVals = {};
-      selectedCollectionIds.forEach(cid => { newVals[cid] = bulkValue; });
-      setMetafieldValues(newVals);
-    }
-  };
 
-  // --------- BULK SUBMIT ----------
-  const handleBulkSubmit = (e) => {
-    e.preventDefault();
-    const updates = selectedCollectionIds.map(cid => {
-      let value = "";
-      if (isListCollectionReference) {
-        value = JSON.stringify(listValues[cid] || []);
-      } else if (isCollectionReference) {
-        value = metafieldValues[cid] ?? "";
-      } else if (isListType || (isJsonType && Array.isArray(listValues[cid]) && selectedOriginalType.startsWith("LIST."))) {
-        const rawList = listValues[cid] || [""];
-        const cleanList = rawList.filter(v => v !== null && v.trim() !== "");
-        value = JSON.stringify(cleanList.length > 0 ? cleanList : []);
-      } else if (isJsonType) {
-        value = metafieldValues[cid] ?? bulkValue ?? "";
-        try { value = JSON.stringify(JSON.parse(value)); } catch { value = ""; }
-      } else {
-        value = metafieldValues[cid] ?? bulkValue ?? "";
+      const ruleData = [];
+      col.exportedRules.forEach(rule => {
+        ruleData.push(rule.column, rule.relation, rule.condition);
+      });
+      // Pad with empty strings if fewer rules than maxRules
+      while (ruleData.length < maxRules * 3) {
+        ruleData.push("", "", "");
       }
-      return { collectionId: cid, value };
+
+      // Convert boolean to "Any" or "All" for export
+      const appliedDisjunctivelyDisplay = col.type === "Smart"
+        ? (col.ruleSet.appliedDisjunctively ? "Any" : "All")
+        : "";
+
+      const rowData = [
+        col.id,
+        col.title,
+        col.descriptionHtml,
+        col.sortOrder || "",
+        col.templateSuffix || "",
+        col.type,
+        appliedDisjunctivelyDisplay,
+        ...ruleData,
+        ...metafieldHeaders.map(key => metafieldMap[key] || ""),
+      ];
+      worksheet.addRow(rowData);
     });
-    if (updates.length === 0 && selectedDef) {
-      alert("No valid metafield values to save.");
-      return;
-    }
-    fetcher.submit(
-      {
-        intent: "updateMetafieldsBulk",
-        definition: selectedDef,
-        updates: JSON.stringify(updates),
-      },
-      { method: "post", action: "." }
-    );
-  };
 
-  // ---------- ROW SUBMIT -----------
-  const handleRowUpdate = (collectionId) => {
-    let value = metafieldValues[collectionId];
-    if (isListCollectionReference) {
-      value = JSON.stringify(listValues[collectionId] || []);
-    } else if (isCollectionReference) {
-      value = metafieldValues[collectionId] ?? "";
-    } else if (isListType || (isJsonType && Array.isArray(listValues[collectionId]) && selectedOriginalType.startsWith("LIST."))) {
-      const rawList = listValues[collectionId] || [""];
-      const cleanList = rawList.filter(v => v !== null && v.trim() !== "");
-      value = JSON.stringify(cleanList.length > 0 ? cleanList : []);
-    } else if (isJsonType && metafieldValues[collectionId]) {
-      value = metafieldValues[collectionId];
-      try { value = JSON.stringify(JSON.parse(value)); } catch (e) { alert("Invalid JSON format."); return; }
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "shopify_collections_export.xlsx";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  }, [collections]);
+
+  const handleDrop = useCallback((files, acceptedFiles) => {
+    if (acceptedFiles.length > 0) {
+      const selectedFile = acceptedFiles[0];
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+      // Pass the known metafield definitions (including namespaces) from the loader to the action
+      formData.append("collectionsData", JSON.stringify({ metafieldDefinitions }));
+
+      setFileName(selectedFile.name);
+      setImportErrors([]);
+      fetcher.submit(formData, { method: "post", encType: "multipart/form-data" });
     }
-    if (!value &&
-      !(isListType || isJsonType || isCollectionReference || isListCollectionReference)
-    ) {
-      if (confirm("Value is empty. Do you want to clear this metafield?")) {
-        handleRowClear(collectionId);
+  }, [fetcher, metafieldDefinitions]);
+
+  useEffect(() => {
+    if (fetcher.state === "submitting" && fileName) {
+      setToastContent(`Importing "${fileName}"... Please wait, this may take a moment.`);
+      setToastError(false);
+      setToastActive(true);
+      setImportErrors([]);
+    } else if (fetcher.state === "idle" && actionData) {
+      if (actionData.success) {
+        setToastContent(actionData.message || "Import completed successfully.");
+        setToastError(false);
+        setToastActive(true);
+        setImportErrors([]);
+      } else {
+        setToastContent(actionData.error || actionData.message || "Import failed. Check error details below.");
+        setToastError(true);
+        setToastActive(true);
+        if (actionData.errors && Array.isArray(actionData.errors)) {
+          setImportErrors(actionData.errors);
+        } else if (actionData.details) {
+          setImportErrors([{ row: 'N/A', message: actionData.details }]);
+        }
       }
-      return;
     }
-    fetcher.submit(
-      { intent: "updateMetafield", collectionId, definition: selectedDef, value },
-      { method: "post", action: "." }
-    );
-  };
-  const handleRowClear = (collectionId) => {
-    fetcher.submit(
-      { intent: "clearMetafield", collectionId, definition: selectedDef },
-      { method: "post", action: "." }
-    );
-  };
+  }, [fetcher.data, fetcher.state, fileName, actionData]);
 
-  // === UI ===
+  useEffect(() => {
+    if (fetcher.state === "idle" && actionData?.success) {
+      revalidator.revalidate(); // Revalidate data after successful import
+    }
+  }, [fetcher.state, actionData?.success, revalidator]);
+
+  const toggleToastActive = useCallback(() => setToastActive(active => !active), []);
+
+  const loading = navigation.state === "submitting" || fetcher.state === "submitting";
+
+  const rows = collections.map(col => [
+    <Link url={`shopify://admin/collections/${col.id.split('/').pop()}`} external>{col.title}</Link>,
+    col.handle,
+    col.type,
+    col.type === "Smart" ? (col.ruleSet.appliedDisjunctively ? "Any" : "All") : "-",
+    col.metafields?.nodes?.length || 0,
+    new Date(col.updatedAt).toLocaleDateString(),
+  ]);
+
   return (
-<Page title="Collection Metafield Bulk Editor">
-  <Layout>
-    <Layout.Section>
-      <Card sectioned>
-        <form onSubmit={handleBulkSubmit}>
-          {/* Selected Collection Chips */}
-          {selectedCollectionIds.length > 0 && (
-            <div style={{ marginBottom: "1rem", display: "flex", flexWrap: "wrap", gap: "8px" }}>
-              {selectedCollectionIds.map(cid => {
-                const col = collectionOptions.find(p => p.value === cid);
-                return (
-                  <span key={cid} style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    background: "#efcdf8", color: "#222", fontWeight: 600,
-                    borderRadius: "16px", padding: "6px 14px 6px 12px", fontSize: "12px",
-                    border: "1px solid #f59e42", marginRight: "4px",
-                  }}>
-                    {col?.label}
-                    <button type="button" onClick={() => handleRemoveCollection(cid)}
-                      style={{
-                        background: "none", border: "none", color: "#d97706",
-                        fontWeight: "bold", fontSize: "15px", marginLeft: "8px", cursor: "pointer",
-                      }}
-                      title="Remove"
-                      aria-label="Remove"
-                    >×</button>
-                  </span>
-                );
-              })}
-            </div>
-          )}
-          {/* Collection Multi-Select */}
-          <div style={{ marginBottom: "1rem" }}>
-            <Autocomplete
-              options={filteredCollectionOptions}
-              selected={[]}
-              onSelect={handleCollectionSelect}
-              allowMultiple
-              textField={
-                <Autocomplete.TextField
-                  label="Search Collections"
-                  value={collectionSearch}
-                  onChange={setCollectionSearch}
-                  placeholder="Search Collection Name"
-                  autoComplete="off"
-                />
-              }
-            />
-          </div>
-          {/* Definition Dropdown */}
-          <div style={{ marginBottom: "1.5rem" }}>
-            <Autocomplete
-              options={filteredDefs}
-              selected={selectedDef ? [selectedDef] : []}
-              onSelect={selected => {
-                setSelectedDef(selected[0] || "");
-                setDefSearch("");
-                setMetafieldValues({});
-                setListValues({});
-                setSuccessMap({});
-                setErrorMap({});
-              }}
-              textField={
-                <Autocomplete.TextField
-                  label="Metafield Definition"
-                  value={defSearch}
-                  onChange={setDefSearch}
-                  placeholder="Search metafield definitions"
-                  clearButton
-                  onClearButtonClick={() => setDefSearch("")}
-                  autoComplete="off"
-                />
-              }
-            />
-          </div>
-          {/* Show selected metafield info */}
-          {selectedDefObj && (
-            <Text style={{marginBottom: 12, color: '#444', display:"block"}}>
-              Selected Metafield: <b>{selectedDefObj?.namespace}.{selectedDefObj?.key}</b> ({selectedDefObj?.type})
-            </Text>
-          )}
-          {/* Bulk Set */}
-          {selectedCollectionIds.length > 1 && selectedDef && (
-            <div style={{ marginBottom: "1.5rem" }}>
-              <Text as="p" variant="bodyMd" style={{ fontWeight: 700, color: "#97530bff", marginBottom: 8 }}>
-                Bulk set value for all selected collections:
-              </Text>
-              {isListCollectionReference ? (
-                <Autocomplete
-                  options={collectionOptions}
-                  selected={bulkListValue}
-                  onSelect={vals => setBulkListValue(vals)}
-                  allowMultiple
-                  textField={
-                    <Autocomplete.TextField
-                      label="Select referenced collections"
-                      value={bulkListValue.map(id => collectionOptions.find(opt => opt.value === id)?.label).filter(Boolean).join(", ")}
-                      onChange={() => {}}
-                      placeholder="Search collections"
-                      autoComplete="off"
-                      readOnly
-                    />
-                  }
-                />
-              ) : isCollectionReference ? (
-                <Autocomplete
-                  options={collectionOptions}
-                  selected={bulkValue ? [bulkValue] : []}
-                  onSelect={vals => setBulkValue(vals[0] || "")}
-                  textField={
-                    <Autocomplete.TextField
-                      label="Select referenced collection"
-                      value={bulkValue ? (collectionOptions.find(c => c.value === bulkValue)?.label || "") : ""}
-                      onChange={() => {}}
-                      placeholder="Search collections"
-                      autoComplete="off"
-                      readOnly
-                    />
-                  }
-                />
-              ) : isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
-                <>
-                  {bulkListValue.map((item, idx) => (
-                    <div key={idx} style={{ display: "flex", alignItems: "center", marginBottom: ".5rem" }}>
-                      <TextField
-                        value={item}
-                        onChange={val => {
-                          const arr = [...bulkListValue]; arr[idx] = val; setBulkListValue(arr);
-                        }}
-                        multiline autoComplete="off" fullWidth
-                        label={idx === 0 ? "Bulk List Item" : undefined}
-                        labelHidden={idx !== 0}
-                      />
-                      {bulkListValue.length > 1 && (
-                        <button type="button" onClick={() => { const arr = [...bulkListValue]; arr.splice(idx, 1); setBulkListValue(arr.length ? arr : [""]); }}
-                          style={{ background: "#fde68a", color: "#765b14", border: "none", borderRadius: 4, cursor: "pointer", marginLeft: 8, fontWeight: "bold", fontSize: 18 }}>
-                          −
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                  <button type="button" onClick={() => setBulkListValue([...bulkListValue, ""])}
-                    style={{ background: "#f6b4cc", color: "#000", border: "none", padding: "6px 12px", borderRadius: 4, cursor: "pointer", marginTop: ".5rem" }}>
-                    ＋ Add List Item
-                  </button>
-                </>
-              ) : (
-                <TextField
-                  value={bulkValue}
-                  onChange={setBulkValue}
-                  label="Bulk Value"
-                  autoComplete="off"
-                  fullWidth
-                  multiline={selectedType === "multi_line_text_field" || selectedType === "rich_text_field" || selectedType === "json"}
-                />
-              )}
-              <Button onClick={handleBulkSet} style={{ marginTop: ".5rem" }}>Set All Values</Button>
-            </div>
-          )}
+    <Page>
+      <TitleBar title="Collections Export/Import" />
+      <Layout>
+        <Layout.Section>
+          <Card sectioned>
+            <LegacyStack spacing="tight" vertical>
+              <Text variant="headingMd" as="h2">Export Collections to Excel</Text>
+              <Text variant="bodyMd" as="p">Download all your Shopify collections, including their core fields, smart collection rules, and custom metafields, into an Excel file. This file can then be updated and re-imported.</Text>
+              <Button onClick={handleDownload} primary disabled={loading || collections.length === 0}>
+                {loading && navigation.state !== "submitting" ? <Spinner size="small" /> : `Export Collections (${collections.length} total)`}
+              </Button>
+            </LegacyStack>
+          </Card>
 
-          {/* Table/List of Collections */}
-          {selectedDef && selectedCollectionIds.length > 0 && (
-            <div style={{ marginBottom: "1.5rem" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: "left", padding: "8px" }}>Collection</th>
-                    <th style={{ textAlign: "left", padding: "8px" }}>Metafield Value</th>
-                    <th style={{ textAlign: "left", padding: "8px" }}>Update</th>
-                    <th style={{ textAlign: "left", padding: "8px" }}>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {selectedCollectionIds.map(cid => {
-                    const collection = collectionOptions.find(c => c.value === cid);
-                    let value = metafieldValues[cid] || "";
-                    let listVal = listValues[cid] || [];
-                    return (
-                      <tr key={cid}>
-                        <td style={{ padding: "8px" }}>{collection?.label}</td>
-                        <td style={{ padding: "8px" }}>
-                          {isListCollectionReference ? (
-                            <Autocomplete
-                              options={collectionOptions}
-                              selected={Array.isArray(listVal) ? listVal : []}
-                              onSelect={vals => handleListValueChange(cid, vals)}
-                              allowMultiple
-                              textField={
-                                <Autocomplete.TextField
-                                  label="Referenced collections"
-                                  value={
-                                    Array.isArray(listVal)
-                                      ? listVal
-                                        .map(id => collectionOptions.find(opt => opt.value === id)?.label)
-                                        .filter(Boolean)
-                                        .join(", ")
-                                      : ""
-                                  }
-                                  onChange={() => {}}
-                                  placeholder="Search collections"
-                                  autoComplete="off"
-                                  readOnly
-                                />
-                              }
-                            />
-                          ) : isCollectionReference ? (
-                            <Autocomplete
-                              options={collectionOptions}
-                              selected={value ? [value] : []}
-                              onSelect={vals => handleValueChange(cid, vals[0] || "")}
-                              textField={
-                                <Autocomplete.TextField
-                                  label="Referenced collection"
-                                  value={
-                                    value
-                                      ? (collectionOptions.find(c => c.value === value)?.label || "")
-                                      : ""
-                                  }
-                                  onChange={() => {}}
-                                  placeholder="Search collections"
-                                  autoComplete="off"
-                                  readOnly
-                                />
-                              }
-                            />
-                          ) : isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
-                            <>
-                              {listVal.map((item, idx) => (
-                                <div key={idx} style={{ display: "flex", alignItems: "center", marginBottom: ".5rem" }}>
-                                  <TextField
-                                    value={item}
-                                    onChange={val => handleListValueChange(cid, listVal.map((it, i) => i === idx ? val : it))}
-                                    multiline autoComplete="off" fullWidth
-                                    label={idx === 0 ? "Metafield Value (List Item)" : undefined}
-                                    labelHidden={idx !== 0}
-                                  />
-                                  {listVal.length > 1 && (
-                                    <button type="button" onClick={() => handleRemoveListItem(cid, idx)}
-                                      style={{
-                                        background: "#f37b7b", color: "white", border: "none", borderRadius: 4,
-                                        cursor: "pointer", marginLeft: "8px", fontWeight: "bold", fontSize: 18
-                                      }}>−</button>
-                                  )}
-                                </div>
-                              ))}
-                              <button type="button" onClick={() => handleAddListItem(cid)}
-                                style={{ background: "#7fabf0", color: "white", border: "none", padding: "3px 9px", borderRadius: 4, cursor: "pointer", marginTop: ".5rem" }}>
-                                ＋ Add List Item
-                              </button>
-                            </>
-                          ) : (
-                            <TextField
-                              label="Metafield Value"
-                              value={value}
-                              onChange={val => handleValueChange(cid, val)}
-                              multiline={selectedType === "multi_line_text_field" || selectedType === "rich_text_field" || selectedType === "json"}
-                              autoComplete="off"
-                              fullWidth
-                            />
-                          )}
-                        </td>
-                        <td style={{ padding: "8px" }}>
-                          <Button onClick={e => { e.preventDefault(); handleRowUpdate(cid); }} size="slim">Update</Button>
-                          <Button destructive size="slim" onClick={e => { e.preventDefault(); handleRowClear(cid); }} style={{ marginLeft: "6px" }}>
-                            Clear Values
-                          </Button>
-                        </td>
-                        <td style={{ padding: "8px" }}>
-                          {successMap[cid] && (
-                            <Text variant="bodyMd" color="success">✅</Text>
-                          )}
-                          {errorMap[cid] && (
-                            <Text variant="bodyMd" color="critical">{errorMap[cid]}</Text>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+          <Card sectioned title="Import Updated Excel File">
+            <LegacyStack spacing="tight" vertical>
+              <Text variant="bodyMd" as="p">
+                Upload an Excel file (preferably one exported from this app) to update existing collections and their metafields.
+                <br />
+                <List type="bullet">
+                  <List.Item>
+                    **Collection ID (Column A):** Leave empty for new collections, use existing GID for updates.
+                  </List.Item>
+                  <List.Item>
+                    **Collection Type:** Enter "Manual" or "Smart".
+                  </List.Item>
+                  <List.Item>
+                    **Smart Collection: Applied Disjunctively:** Enter "Any" (for product must match any condition) or "All" (for product must match all conditions).
+                  </List.Item>
+                  <List.Item>
+                    **Smart Collection Rules:** For "Smart" collections, use `Rule X - Column`, `Rule X - Relation`, `Rule X - Condition` columns to define each rule. Each rule requires all three parts.
+                  </List.Item>
+                  <List.Item>
+                    **Metafields:** Custom metafields start after the standard and rule columns. The header should be the metafield's `key`.
+                  </List.Item>
+                  <List.Item>
+                    **Reference Types (`collection_reference`, `list.collection_reference`, etc.):** Values in Excel must be raw Shopify GID(s). For list types, a valid JSON array string of GIDs (e.g., `["gid://...","gid://..."]`).
+                  </List.Item>
+                </List>
+              </Text>
+              <DropZone allowMultiple={false} onDrop={handleDrop} disabled={loading} accept=".xlsx">
+                {fileName ? <Text alignment="center">Selected file: {fileName}</Text> : <DropZone.FileUpload actionHint="Accepts .xlsx files only" />}
+              </DropZone>
+              {loading && <Text alignment="center" variant="bodyMd"><Spinner size="small" /> Processing import... This may take a moment.</Text>}
+            </LegacyStack>
+          </Card>
+
+          {importErrors.length > 0 && (
+            <Layout.Section>
+              <Card sectioned title="Import Errors Detected">
+                <LegacyStack vertical spacing="tight">
+                  <Text color="critical" variant="headingSm">The following issues were found during the import:</Text>
+                  <DataTable
+                    columnContentTypes={["text", "text"]}
+                    headings={["Row #", "Error Message"]}
+                    rows={importErrors.map(err => [err.row || 'N/A', err.message])}
+                  />
+                  <Text>Please correct these issues in your Excel file and try re-importing.</Text>
+                </LegacyStack>
+              </Card>
+            </Layout.Section>
           )}
-          {/* Save/Update Button */}
-          <Button
-            submit
-            primary
-            loading={fetcher.state === "submitting" || fetcher.state === "loading"}
-            disabled={
-              !selectedCollectionIds.length ||
-              !selectedDef ||
-              fetcher.state === "submitting" ||
-              fetcher.state === "loading"
-            }
-            style={{
-              backgroundColor: "#16a34a",
-              color: "white",
-              padding: "10px 20px",
-              borderRadius: "6px",
-            }}
-          >
-            Save All Metafields
-          </Button>
-        </form>
-      </Card>
-    </Layout.Section>
-  </Layout>
-</Page>
+        </Layout.Section>
+
+        {collections.length > 0 && (
+          <Layout.Section>
+            <Card title={`Existing Collections (${collections.length})`} sectioned>
+              <DataTable
+                columnContentTypes={["text", "text", "text", "text", "numeric", "text"]}
+                headings={["Title", "Handle", "Type", "Smart Logic", "Metafields Count", "Updated At"]}
+                rows={rows}
+              />
+            </Card>
+          </Layout.Section>
+        )}
+      </Layout>
+
+      {toastActive && (
+        <Frame>
+          <Toast content={toastContent} error={toastError} onDismiss={toggleToastActive} duration={5000} />
+        </Frame>
+      )}
+    </Page>
   );
 }

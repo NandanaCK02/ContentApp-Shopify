@@ -1,762 +1,1813 @@
-// app/routes/collections.jsx
-
-import { json, unstable_parseMultipartFormData, unstable_createMemoryUploadHandler } from "@remix-run/node";
-import {
-  Form,
-  useActionData,
-  useLoaderData,
-  useNavigation,
-  useFetcher,
-} from "@remix-run/react";
+import { json, unstable_createMemoryUploadHandler, unstable_parseMultipartFormData } from "@remix-run/node";
+import { useLoaderData, useFetcher } from "@remix-run/react";
+import { authenticate } from "../shopify.server";
 import {
   Page,
   Layout,
   Card,
+  Autocomplete,
+  TextField,
   Button,
-  LegacyStack,
+  Select,
   Text,
-  DropZone,
-  DataTable,
-  Frame,
-  Toast,
-  Link,
-  List,
+  Modal,
+  Form,
+  FormLayout,
 } from "@shopify/polaris";
-import { TitleBar } from "@shopify/app-bridge-react";
-import { useState, useCallback, useEffect } from "react";
-import { authenticate } from "../shopify.server";
-import ExcelJS from "exceljs";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import {
+  useActionData,
+  useNavigation,
+  Form as RemixForm,
+} from "@remix-run/react";
+// Type Map (remains unchanged)
+const typeMap = {
+  Single_line_text_field: "single_line_text_field",
+  MULTILINE_TEXT_FIELD: "multi_line_text_field",
+  RICH_TEXT: "rich_text_field",
+  INTEGER: "number_integer",
+  FLOAT: "number_decimal",
+  BOOLEAN: "boolean",
+  JSON: "json",
+  DATE: "date",
+  DATETIME: "date_time",
+  MONEY: "money",
+  URL: "url",
+  COLOR: "color",
+  RATING: "rating",
+  DIMENSION: "dimension",
+  VOLUME: "volume",
+  WEIGHT: "weight",
+  PRODUCT_REFERENCE: "product_reference",
+  VARIANT_REFERENCE: "variant_reference",
+  COLLECTION_REFERENCE: "collection_reference",
+  FILE_REFERENCE: "file_reference",
+  PAGE_REFERENCE: "page_reference",
+  CUSTOMER_REFERENCE: "customer_reference",
+  COMPANY_REFERENCE: "company_reference",
+  METAOBJECT_REFERENCE: "metaobject_reference",
+  mixed_reference: "mixed_reference",
+  "list.single_line_text_field": "list.single_line_text_field",
+  "list.number_integer": "list.number_integer",
+  "list.boolean": "list.boolean",
+  "list.json": "list.json",
+  "list.collection_reference": "list.collection_reference",
+};
 
-// --- GraphQL Queries and Mutations ---
+// Reverse Type Map for displaying original types
+const reverseTypeMap = Object.fromEntries(
+  Object.entries(typeMap).map(([key, value]) => [value, key])
+);
 
-const GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY = `
-  query getCollections($cursor: String) {
-    collections(first: 250, after: $cursor) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        id
-        handle
-        title
-        descriptionHtml
-        sortOrder
-        templateSuffix
-        updatedAt
-        image { src }
-        metafields(first: 250) {
-          nodes {
-            namespace
-            key
-            value
-            type # <-- Crucial: We need the metafield's defined type for export and import logic
-          }
-        }
-      }
-    }
-  }
-`;
+export async function loader({ request }) {
+  const { admin } = await authenticate.admin(request);
 
-const UPDATE_COLLECTION_MUTATION = `
-  mutation collectionUpdate($input: CollectionInput!) {
-    collectionUpdate(input: $input) {
-      collection { id }
-      userErrors { field message }
-    }
-  }
-`;
-
-const CREATE_METAFIELD_MUTATION = `
-  mutation setMetafields($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      metafields { id }
-      userErrors { field message }
-    }
-  }
-`;
-
-const GET_COLLECTION_TITLES_QUERY = `
-  query getCollectionTitles($ids: [ID!]!) {
-    nodes(ids: $ids) {
-      ... on Collection {
-        id
-        title
-      }
-    }
-  }
-`;
-
-// --- Loader ---
-
-export const loader = async ({ request }) => {
-  const { session, admin } = await authenticate.admin(request);
-
-  if (!session || !admin) {
-    throw new Response("Unauthorized", { status: 401 });
-  }
-
-  let collections = [];
-  let cursor = null;
+  let products = [];
+  let productCursor = null;
   let hasNextPage = true;
 
-  try {
-    while (hasNextPage) {
-      const response = await admin.graphql(GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY, {
-        variables: { cursor },
-      });
-      const data = await response.json();
-
-      if (data.errors) {
-        console.error("GraphQL loader errors (GET_ALL_COLLECTIONS_WITH_METAFIELDS):", JSON.stringify(data.errors, null, 2));
-        throw new Error(`Failed to fetch collections: ${JSON.stringify(data.errors.map(e => e.message).join(", "))}`);
-      }
-
-      const result = data.data.collections;
-
-      collections.push(...result.nodes);
-      hasNextPage = result.pageInfo.hasNextPage;
-      cursor = result.pageInfo.endCursor;
-    }
-
-    // Convert GIDs in metafield values to names for display in the UI
-    // IMPORTANT: This conversion is for display ONLY. The `metafield.type` is crucial for export.
-    for (const collection of collections) {
-      for (const metafield of collection.metafields.nodes) {
-        if (metafield.type === 'list.collection_reference' && typeof metafield.value === 'string') {
-            let gids = [];
-            try {
-                const parsed = JSON.parse(metafield.value); // Value from Shopify for list.collection_reference is a JSON array string
-                if (Array.isArray(parsed)) {
-                    gids = parsed;
-                }
-            } catch {
-                // Not a valid JSON array string, might be malformed or empty
-                gids = [];
-            }
-
-            const validGids = [...new Set(gids.filter(gid => typeof gid === 'string' && gid.startsWith("gid://shopify/Collection/")))];
-
-            if (validGids.length > 0) {
-                try {
-                    const response = await admin.graphql(GET_COLLECTION_TITLES_QUERY, {
-                        variables: { ids: validGids },
-                    });
-                    const result = await response.json();
-
-                    if (result.errors) {
-                        console.error("GraphQL loader (GET_COLLECTION_TITLES) errors for metafield GIDs:", JSON.stringify(result.errors, null, 2));
-                        continue;
-                    }
-
-                    const titleMap = {};
-                    for (const node of result.data.nodes) {
-                        if (node && node.id && node.title) titleMap[node.id] = node.title;
-                    }
-                    metafield.displayValue = validGids.map((gid) => titleMap[gid] || `[Invalid GID: ${gid}]`).join(", ");
-                } catch (error) {
-                    console.error(`Error resolving GIDs for collection ${collection.id}, metafield ${metafield.key}:`, error);
-                    metafield.displayValue = "Error resolving references.";
-                }
-            } else {
-                metafield.displayValue = ""; // No valid GIDs to display
-            }
-        } else if (metafield.type === 'collection_reference' && typeof metafield.value === 'string' && metafield.value.startsWith("gid://shopify/Collection/")) {
-            // For single collection_reference
-            try {
-                const response = await admin.graphql(GET_COLLECTION_TITLES_QUERY, {
-                    variables: { ids: [metafield.value] },
-                });
-                const result = await response.json();
-                if (!result.errors && result.data?.nodes?.[0]?.title) {
-                    metafield.displayValue = result.data.nodes[0].title;
-                } else {
-                    metafield.displayValue = `[Invalid GID: ${metafield.value}]`;
-                }
-            } catch (error) {
-                console.error(`Error resolving single GID for collection ${collection.id}, metafield ${metafield.key}:`, error);
-                metafield.displayValue = "Error resolving reference.";
-            }
-        } else {
-            // For all other metafield types, display the raw value
-            metafield.displayValue = metafield.value;
+  while (hasNextPage) {
+    const res = await admin.graphql(`
+      {
+        products(first: 100${productCursor ? `, after: "${productCursor}"` : ""}) {
+          edges {
+            cursor
+            node { id title }
+          }
+          pageInfo { hasNextPage }
         }
       }
-    }
-  } catch (error) {
-    console.error("Error in collections loader:", error);
-    return json({ collections: [], error: error.message || "Failed to load collections." }, { status: 500 });
+    `);
+    const data = await res.json();
+    const edges = data?.data?.products?.edges || [];
+    products.push(...edges.map((e) => e.node));
+    hasNextPage = data?.data?.products?.pageInfo?.hasNextPage;
+    if (hasNextPage) productCursor = edges[edges.length - 1].cursor;
   }
 
-  return json({ collections });
-};
+  let definitions = [];
+  let defCursor = null;
+  hasNextPage = true;
 
-// --- Action (Import) ---
-
-export const action = async ({ request }) => {
-  const { session, admin } = await authenticate.admin(request);
-  if (!session) {
-    return json({ success: false, error: "Authentication required.", status: 401 }, { status: 401 });
-  }
-
-  const uploadHandler = unstable_createMemoryUploadHandler({ maxPartSize: 50_000_000 }); // 50 MB
-  let formData;
-  try {
-    formData = await unstable_parseMultipartFormData(request, uploadHandler);
-  } catch (error) {
-    console.error("Error parsing multipart form data:", error);
-    return json({ success: false, error: "Failed to parse file upload. File might be too large or corrupted.", details: error.message }, { status: 400 });
-  }
-
-  const file = formData.get("file");
-
-  if (!file || !(file instanceof Blob)) {
-    return json({ success: false, error: "No file uploaded or invalid file type. Please upload an Excel (.xlsx) file.", status: 400 }, { status: 400 });
-  }
-
-  let workbook;
-  let worksheet;
-  let headerRow;
-  let metafieldKeys = [];
-  // Store original metafield types from loader for use in action
-  let originalMetafieldTypesMap = {};
-
-  try {
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer);
-    worksheet = workbook.worksheets[0];
-
-    if (!worksheet) {
-      return json({ success: false, error: "Excel file is empty or invalid format. No worksheet found.", status: 400 });
-    }
-
-    headerRow = worksheet.getRow(1);
-    if (!headerRow || headerRow.values.length < 6) { // Collection ID, Title, Description Html, Sort Order, Template Suffix
-      return json({ success: false, error: "Excel file is missing expected header columns (Collection ID, Title, Description Html, Sort Order, Template Suffix).", status: 400 });
-    }
-
-    // Extract metafield keys from headers
-    metafieldKeys = headerRow.values
-      .slice(6) // Metafields start from Column F (index 6)
-      .filter(h => typeof h === "string" && h.trim() !== "")
-      .map(h => h.trim());
-
-    if (metafieldKeys.length > 0) {
-        console.log("Identified Metafield Keys for import:", metafieldKeys);
-    }
-
-    // --- NEW: Fetch collection data again to get metafield *definitions* (types) ---
-    // This is crucial for matching types on import.
-    // This is a tradeoff: another API call, but ensures correct type handling.
-    // An alternative: pass original types from loader to client and then to action via hidden field.
-    // For simplicity and directness, fetching here:
-    const { session: currentSession, admin: currentAdmin } = await authenticate.admin(request);
-    if (!currentSession || !currentAdmin) {
-        // Should not happen if previous auth check passed, but for safety
-        return json({ success: false, error: "Authentication required for type lookup.", status: 401 }, { status: 401 });
-    }
-
-    let allCollectionsForTypes = [];
-    let typeCursor = null;
-    let typeHasNextPage = true;
-    while(typeHasNextPage) {
-        const typeResponse = await currentAdmin.graphql(GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY, {
-            variables: { cursor: typeCursor },
-        });
-        const typeData = await typeResponse.json();
-        if (typeData.errors) {
-            console.error("GraphQL loader errors (GET_ALL_COLLECTIONS_WITH_METAFIELDS for types):", JSON.stringify(typeData.errors, null, 2));
-            // Don't fail import entirely, but log and proceed with best guess types
-            break;
-        }
-        const typeResult = typeData.data.collections;
-        allCollectionsForTypes.push(...typeResult.nodes);
-        typeHasNextPage = typeResult.pageInfo.hasNextPage;
-        typeCursor = typeResult.pageInfo.endCursor;
-    }
-
-    // Build a map of metafield key to its defined type from Shopify
-    allCollectionsForTypes.forEach(collection => {
-        collection.metafields.nodes.forEach(mf => {
-            // Take the first encountered type for a key. Assumes consistency across collections.
-            if (!originalMetafieldTypesMap[mf.key]) {
-                originalMetafieldTypesMap[mf.key] = mf.type;
+  while (hasNextPage) {
+    const res = await admin.graphql(`
+      {
+        metafieldDefinitions(first: 100, ownerType: PRODUCT${defCursor ? `, after: "${defCursor}"` : ""}) {
+          edges {
+            cursor
+            node {
+              name
+              namespace
+              key
+              type { name }
+              id
             }
-        });
+          }
+          pageInfo { hasNextPage }
+        }
+      }
+    `);
+    const data = await res.json();
+    const edges = data?.data?.metafieldDefinitions?.edges || [];
+    definitions.push(
+      ...edges.map((e) => {
+        let typeKey = e.node.type.name;
+        if (typeKey.startsWith("LIST.")) typeKey = "LIST." + typeKey.split(".")[1];
+        return {
+          ...e.node,
+          type: typeMap[typeKey] || e.node.type.name, // Display friendly type
+          originalType: e.node.type.name, // Actual Shopify API type
+        };
+      })
+    );
+    hasNextPage = data?.data?.metafieldDefinitions?.pageInfo?.hasNextPage;
+    if (hasNextPage) defCursor = edges[edges.length - 1].cursor;
+  }
+
+  return json({ products, definitions });
+}
+
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 2000;
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+export async function action({ request }) {
+  const contentType = request.headers.get("content-type");
+  if (request.method === "POST" && contentType?.includes("multipart/form-data")) {
+    const uploadHandler = unstable_createMemoryUploadHandler({ maxPartSize: 10_000_000 });
+    const formData = await unstable_parseMultipartFormData(request, uploadHandler);
+    const file = formData.get("file");
+    if (!file || typeof file !== "object") {
+      return json({ success: false, error: "No file uploaded" }, { status: 400 });
+    }
+    let admin;
+try {
+  const authResult = await authenticate.admin(request);
+
+  if (!authResult || !authResult.admin) {
+    console.error("Authentication failed: No admin session returned.");
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  admin = authResult.admin;
+} catch (err) {
+  console.error("Authentication error during file upload/action:", err);
+  return new Response("Unauthorized - error in authenticate.admin", { status: 401 });
+}
+
+
+    // 1. Get staged upload target
+    const stagedUploadRes = await admin.graphql(`
+      mutation {
+        stagedUploadsCreate(input: [{
+          filename: "${file.name}",
+          mimeType: "${file.type}",
+          resource: FILE,
+          httpMethod: POST
+        }]) {
+          stagedTargets { url resourceUrl parameters { name value } }
+          userErrors { field message }
+        }
+      }
+    `);
+    const stagedUploadData = await stagedUploadRes.json();
+    const target = stagedUploadData.data?.stagedUploadsCreate?.stagedTargets?.[0];
+    if (!target) {
+      console.error("Failed to get staged upload target:", stagedUploadData.data?.stagedUploadsCreate?.userErrors);
+      return json({ success: false, error: "Failed to prepare file upload." }, { status: 500 });
+    }
+
+    // 2. Upload file to Shopify storage
+    const formUpload = new FormData();
+    for (const param of target.parameters) formUpload.append(param.name, param.value);
+    formUpload.append("file", file);
+    const uploadResponse = await fetch(target.url, { method: "POST", body: formUpload });
+    if (!uploadResponse.ok) {
+      console.error("Failed to upload to Shopify storage:", uploadResponse.statusText);
+      return json({ success: false, error: "Failed to upload file to Shopify's storage." }, { status: 500 });
+    }
+
+    // 3. Register file in Shopify
+    let createdFileId = null;
+    try {
+      const fileCreateRes = await admin.graphql(`
+        mutation {
+          fileCreate(files: [{
+            originalSource: "${target.resourceUrl}",
+            contentType: FILE,
+            alt: "${file.name}"
+          }]) {
+            files { ... on GenericFile { id url } }
+            userErrors { field message }
+          }
+        }
+      `);
+      const fileCreateData = await fileCreateRes.json();
+      const createdFile = fileCreateData.data?.fileCreate?.files?.[0];
+      const userErrors = fileCreateData.data?.fileCreate?.userErrors || [];
+
+      if (userErrors.length > 0) {
+        console.error("Errors during file creation:", userErrors);
+        return json({ success: false, error: userErrors.map(e => e.message).join(", ") }, { status: 500 });
+      }
+      if (!createdFile || !createdFile.id) {
+        console.error("File creation successful but no ID returned:", fileCreateData);
+        return json({ success: false, error: "Shopify created the file, but its ID wasn't immediately available." }, { status: 500 });
+      }
+      createdFileId = createdFile.id;
+    } catch (err) {
+      console.error("Error creating file in Shopify:", err);
+      return json({ success: false, error: "An unexpected error occurred during file registration with Shopify." }, { status: 500 });
+    }
+
+    // 4. Poll for the file URL with retries
+    let fileUrl = null;
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      await delay(RETRY_DELAY_MS);
+      const fetchFileRes = await admin.graphql(`
+        query getFileUrl($id: ID!) {
+          node(id: $id) {
+            ... on GenericFile {
+              url
+            }
+          }
+        }
+      `, { variables: { id: createdFileId } });
+
+      const fetchFileData = await fetchFileRes.json();
+      const fetchedFile = fetchFileData.data?.node;
+
+      if (fetchedFile?.url && /^https?:\/\//.test(fetchedFile.url)) {
+        fileUrl = fetchedFile.url;
+        break;
+      }
+      console.log(`Retry ${i + 1}/${MAX_RETRIES}: File URL not ready for ID ${createdFileId}`);
+    }
+
+    if (!fileUrl) {
+      console.error(`Failed to get final file URL after ${MAX_RETRIES} retries for ID: ${createdFileId}`);
+      return json({
+        success: false,
+        error: "Shopify is still processing your file. Please try again later or manually update the metafield.",
+        fileId: createdFileId,
+      }, { status: 500 });
+    }
+
+    return json({ success: true, url: fileUrl, intent: "uploadFile" });
+  }
+
+  const { admin } = await authenticate.admin(request);
+  const form = await request.formData();
+  const intent = form.get("intent");
+
+if (intent === "createMetafieldDefinition") {
+  const namespace = form.get("namespace");
+  const key = form.get("key");
+  const name = form.get("name");
+  const friendlyType = form.get("type"); // Should be exact Shopify metafield type like "single_line_text_field"
+  const description = form.get("description");
+
+  if (!namespace || !key || !name || !friendlyType) {
+    return json({
+      success: false,
+      errors: [{ message: "Namespace, Key, Name, and Type are required." }],
+      intent,
     });
-    console.log("Original Metafield Types Map:", originalMetafieldTypesMap);
-
-
-  } catch (error) {
-    console.error("Error reading Excel file or fetching metafield types:", error);
-    return json({ success: false, error: `Failed to read Excel file or retrieve metafield types: ${error.message}. Ensure it's a valid .xlsx format.`, status: 400 }, { status: 400 });
   }
+  const shopifyType = typeMap[friendlyType];
 
-  let errors = [];
-  let processedRowsCount = 0;
-  let updatedCollectionsCount = 0;
-  let updatedMetafieldsCount = 0;
-
-  for (let rowIndex = 2; rowIndex <= worksheet.rowCount; rowIndex++) {
-    const row = worksheet.getRow(rowIndex);
-    const id = row.getCell(1)?.value?.toString()?.trim(); // Collection ID is Column A (index 1)
-    const title = row.getCell(2)?.value?.toString() || ""; // Title is Column B (index 2)
-    const descriptionHtml = row.getCell(3)?.value?.toString() || ""; // Description is Column C (index 3)
-    const sortOrderRaw = row.getCell(4)?.value; // Sort Order is Column D (index 4)
-    const templateSuffix = row.getCell(5)?.value?.toString() || null; // Template Suffix is Column E (index 5)
-
-    // Validate Collection ID
-    if (!id || !id.startsWith("gid://shopify/Collection/")) {
-      errors.push({
-        row: rowIndex,
-        message: `Missing or invalid Collection ID in Column A. Expected format: 'gid://shopify/Collection/12345'. Found: "${id || 'EMPTY'}"`
+    if (!shopifyType) {
+      return json({
+        success: false,
+        errors: [
+          { message: `Invalid metafield type: ${friendlyType}` },
+        ],
       });
-      continue;
     }
 
-    const input = {
-      id: id, // Pass the GID within the input object
-      title,
-      descriptionHtml,
+  try {
+    const mutation = `
+      mutation CreateMetafieldDefinition($definition: MetafieldDefinitionInput!) {
+        metafieldDefinitionCreate(definition: $definition) {
+          createdDefinition {
+            id
+            key
+            namespace
+            name
+            type { name }
+          }
+          userErrors {
+            field
+            message
+            code
+          }
+        }
+      }
+    `;
+
+    const variables = {
+      definition: {
+        key,
+        namespace,
+        name,
+        ownerType: "PRODUCT",
+        type: shopifyType,
+        description: description || null,
+      },
     };
 
-    if (sortOrderRaw) {
-      const sortOrder = sortOrderRaw.toString().toUpperCase().trim();
-      const validSortOrders = ['ALPHA_ASC', 'ALPHA_DESC', 'BEST_SELLING', 'CREATED', 'MANUAL', 'PRICE_ASC', 'PRICE_DESC'];
-      if (validSortOrders.includes(sortOrder)) {
-        input.sortOrder = sortOrder;
-      } else {
-          errors.push({ row: rowIndex, message: `Invalid Sort Order value in Column D: "${sortOrderRaw}". Must be one of: ${validSortOrders.join(", ")}. Skipping sortOrder update.` });
-      }
+    const response = await admin.graphql(mutation, { variables });
+    const result = await response.json();
+
+    const userErrors = result?.data?.metafieldDefinitionCreate?.userErrors || [];
+    const createdDef = result?.data?.metafieldDefinitionCreate?.definition;
+
+    if (userErrors.length > 0) {
+      return json({ success: false, errors: userErrors, intent });
     }
 
-    if (templateSuffix) {
-      input.templateSuffix = templateSuffix;
+    return json({ success: true, definition: createdDef, intent });
+
+  } catch (err) {
+    console.error("Metafield definition creation error:", err);
+    return json({
+      success: false,
+      errors: [{ message: "Unexpected server error." }],
+      intent,
+    });
+  }
+}
+
+
+  // BULK UPDATE
+  if (intent === "updateMetafieldsBulk") {
+    const definition = form.get("definition");
+    const updates = JSON.parse(form.get("updates") || "[]");
+    if (!definition || !Array.isArray(updates) || updates.length === 0) {
+      return json({ success: false, errors: [{ message: "Definition and at least one update required." }], intent });
     }
+    const [namespace, key, originalType] = definition.split("___");
 
-    // --- Update Collection Core Fields ---
-    let collectionUpdateSuccess = false;
-    try {
-      const updateResponse = await admin.graphql(UPDATE_COLLECTION_MUTATION, {
-        variables: { input },
-      });
-      const updateResult = await updateResponse.json();
-
-      if (updateResult.errors) {
-        errors.push({
-          row: rowIndex,
-          message: `Collection update GraphQL errors: ${JSON.stringify(updateResult.errors.map(e => e.message).join(", "))}`,
-        });
-      } else if (updateResult.data?.collectionUpdate?.userErrors?.length) {
-        errors.push({
-          row: rowIndex,
-          message: `Collection update user errors: ${JSON.stringify(updateResult.data.collectionUpdate.userErrors.map(e => `${e.field}: ${e.message}`).join("; "))}`,
-        });
-      } else {
-        updatedCollectionsCount++;
-        collectionUpdateSuccess = true;
-      }
-    } catch (e) {
-      console.error(`Error updating collection ${id} (row ${rowIndex}):`, e);
-      errors.push({ row: rowIndex, message: `Collection update failed for ID ${id}: ${e.message}` });
-    }
-
-    // --- Update Metafields ---
-    const metafieldInputs = [];
-    for (let i = 0; i < metafieldKeys.length; i++) {
-      const colIndexForMetafield = i + 6; // Metafields start from Column F (index 6)
-      const key = metafieldKeys[i];
-      const rawValue = row.getCell(colIndexForMetafield)?.value;
-
-      // Determine the Shopify defined type for this metafield key
-      const shopifyDefinedType = originalMetafieldTypesMap[key] || "single_line_text_field"; // Default if not found
-
-      if (rawValue !== null && rawValue !== undefined && rawValue.toString().trim() !== "") {
-        let valueToSet = rawValue.toString().trim();
-        let metafieldType = shopifyDefinedType; // Start with the known definition type
-
-        // --- METAFIELD TYPE & VALUE VALIDATION LOGIC ---
-
-        if (shopifyDefinedType === 'list.collection_reference') {
-            // For list.collection_reference, value *must* be a JSON string of GIDs.
-            // Try to parse it, if it's not a valid array, handle it.
-            try {
-                const parsedValue = JSON.parse(valueToSet);
-                if (!Array.isArray(parsedValue) || parsedValue.some(item => typeof item !== 'string' || !item.startsWith("gid://shopify/Collection/"))) {
-                    // It's JSON but not an array of GIDs, or contains invalid GIDs
-                    errors.push({
-                        row: rowIndex,
-                        message: `Metafield '${key}' in Column ${String.fromCharCode(65 + colIndexForMetafield -1)}: Expected a JSON array of valid GIDs for 'list.collection_reference'. Found "${valueToSet}". Setting an empty list.`
-                    });
-                    valueToSet = JSON.stringify([]);
-                }
-                // Else, valueToSet is already a valid JSON array of GIDs, keep as is
-            } catch (e) {
-                // Not a valid JSON string at all
-                if (valueToSet.startsWith("gid://shopify/Collection/")) {
-                    // If it's a single GID, wrap it in a JSON array string
-                    valueToSet = JSON.stringify([valueToSet]);
-                } else if (valueToSet.startsWith("gid://shc")) {
-                     // Incomplete GID - treat as invalid. You might want to remove this or log it more harshly.
-                     errors.push({ row: rowIndex, message: `Metafield '${key}' in Column ${String.fromCharCode(65 + colIndexForMetafield -1)}: Incomplete GID "${valueToSet}". Expected full GID for 'list.collection_reference'. Setting an empty list.` });
-                     valueToSet = JSON.stringify([]);
-                } else {
-                    errors.push({
-                        row: rowIndex,
-                        message: `Metafield '${key}' in Column ${String.fromCharCode(65 + colIndexForMetafield -1)}: Invalid format for 'list.collection_reference'. Expected JSON array string of GIDs. Found "${valueToSet}". Setting an empty list.`
-                    });
-                    valueToSet = JSON.stringify([]);
-                }
-            }
-        } else if (shopifyDefinedType === 'collection_reference') {
-            // For single collection_reference, value *must* be a single GID string.
-            if (!valueToSet.startsWith("gid://shopify/Collection/")) {
-                errors.push({
-                    row: rowIndex,
-                    message: `Metafield '${key}' in Column ${String.fromCharCode(65 + colIndexForMetafield -1)}: Expected a single valid GID for 'collection_reference'. Found "${valueToSet}". Setting null.`
-                });
-                valueToSet = null; // Set to null for single reference if invalid
-            }
-            // Else, valueToSet is a valid single GID, keep as is
-        } else if (shopifyDefinedType === 'number_integer' || shopifyDefinedType === 'number_decimal') {
-            if (isNaN(parseFloat(valueToSet))) {
-                errors.push({
-                    row: rowIndex,
-                    message: `Metafield '${key}' in Column ${String.fromCharCode(65 + colIndexForMetafield -1)}: Expected a number. Found "${valueToSet}". Setting null.`
-                });
-                valueToSet = null;
-            } else {
-                valueToSet = parseFloat(valueToSet).toString(); // Ensure it's a string representation of the number
-            }
-        } else if (shopifyDefinedType === 'json') {
-            if (!isValidJson(valueToSet)) {
-                errors.push({
-                    row: rowIndex,
-                    message: `Metafield '${key}' in Column ${String.fromCharCode(65 + colIndexForMetafield -1)}: Expected valid JSON. Found "${valueToSet}". Setting null.`
-                });
-                valueToSet = null;
-            }
+    const mutation = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { key namespace value }
+          userErrors { field message }
         }
-        // Add more specific handling for other known types (boolean, url, date, etc.)
-        // For 'file_reference' or 'image_reference', `valueToSet` should be the GID of the file/image.
-
-        if (valueToSet !== null) { // Only add if value is not explicitly null
-            metafieldInputs.push({
-              ownerId: id,
-              namespace: "custom", // Default namespace
-              key,
-              type: metafieldType, // Use the determined type
-              value: valueToSet,
-            });
-        }
-      } else {
-          // If the cell is empty, and it's a reference type, consider setting to null to clear it
-          if (shopifyDefinedType === 'collection_reference' || shopifyDefinedType === 'list.collection_reference' /* add other reference types */) {
-               metafieldInputs.push({
-                  ownerId: id,
-                  namespace: "custom",
-                  key,
-                  type: shopifyDefinedType, // Must provide correct type even for nulling
-                  value: null, // Set to null to clear the reference
-               });
-          }
       }
-    }
+    `;
 
-    if (metafieldInputs.length > 0) {
+    const results = await Promise.all(updates.map(async ({ productId, value }) => {
+      if (!productId) return { productId, success: false, errors: [{ message: "Missing productId" }] };
       try {
-        const metafieldResponse = await admin.graphql(CREATE_METAFIELD_MUTATION, {
-          variables: { metafields: metafieldInputs },
-        });
-        const metafieldResult = await metafieldResponse.json();
-
-        if (metafieldResult.errors) {
-            errors.push({
-                row: rowIndex,
-                message: `Metafield GraphQL errors: ${JSON.stringify(metafieldResult.errors.map(e => e.message).join(", "))}`
-            });
-        } else if (metafieldResult.data?.metafieldsSet?.userErrors?.length) {
-          errors.push({
-            row: rowIndex,
-            message: `Metafield update user errors: ${JSON.stringify(metafieldResult.data.metafieldsSet.userErrors.map(e => `${e.field}: ${e.message}`).join("; "))}`,
-          });
-        } else if (metafieldResult.data?.metafieldsSet?.metafields?.length) {
-            updatedMetafieldsCount += metafieldResult.data.metafieldsSet.metafields.length;
+        const variables = {
+          metafields: [
+            {
+              ownerId: productId,
+              namespace,
+              key,
+              type: originalType,
+              value,
+            },
+          ],
+        };
+        const response = await admin.graphql(mutation, { variables });
+        const result = await response.json();
+        const userErrors = result?.data?.metafieldsSet?.userErrors || [];
+        if (userErrors.length > 0) {
+          return { productId, success: false, errors: userErrors };
         }
-
-      } catch (e) {
-        console.error(`Error updating metafields for collection ${id} (row ${rowIndex}):`, e);
-        errors.push({ row: rowIndex, message: `Metafield update failed for ID ${id}: ${e.message}` });
+        return { productId, success: true };
+      } catch (err) {
+        return { productId, success: false, errors: [{ message: "Server error" }] };
       }
+    }));
+
+    const allSuccess = results.every(r => r.success);
+    return json({ success: allSuccess, results, intent });
+  }
+
+  // SINGLE PRODUCT UPDATE (for per-row update)
+  if (intent === "updateMetafield") {
+    const productId = form.get("productId");
+    const definition = form.get("definition");
+    const value = form.get("value");
+    if (!productId || !definition || value === null) {
+      return json({ success: false, errors: [{ message: "Product ID, definition, and value are required." }], intent: "updateMetafield" });
     }
-    processedRowsCount++;
+    const [namespace, key, originalType] = definition.split("___");
+    if (originalType === "URL" && !/^https?:\/\//.test(value)) {
+      return json({
+        success: false,
+        errors: [{ message: "URL metafield value must start with http:// or https://." }],
+        intent: "updateMetafield",
+      });
+    }
+    const mutation = `
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { key namespace value }
+          userErrors { field message }
+        }
+      }
+    `;
+    const variables = {
+      metafields: [
+        {
+          ownerId: productId,
+          namespace,
+          key,
+          type: originalType,
+          value: value,
+        },
+      ],
+    };
+
+    try {
+      const response = await admin.graphql(mutation, { variables });
+      const result = await response.json();
+      const userErrors = result?.data?.metafieldsSet?.userErrors || [];
+      if (userErrors.length > 0) {
+        return json({ success: false, errors: userErrors, intent: "updateMetafield", productId });
+      }
+      return json({ success: true, intent: "updateMetafield", productId });
+    } catch (err) {
+      console.error("Metafield mutation error:", err);
+      return json({
+        success: false,
+        errors: [{ message: "Server error during metafield update." }],
+        intent: "updateMetafield",
+        productId,
+      });
+    }
   }
 
-  let summaryMessage = `Import process completed.`;
-  if (errors.length > 0) {
-    summaryMessage += ` ${updatedCollectionsCount} collections updated successfully, ${updatedMetafieldsCount} metafields set. Found ${errors.length} row-level errors.`;
-  } else {
-    summaryMessage += ` All ${processedRowsCount} collections and their metafields updated successfully.`;
+  // BULK GET
+  if (intent === "getMetafieldValuesBulk") {
+    const definition = form.get("definition");
+    const productIds = JSON.parse(form.get("productIds") || "[]");
+    if (!definition || !Array.isArray(productIds) || productIds.length === 0) {
+      return json({ success: false, errors: [{ message: "Definition and at least one product required." }], intent });
+    }
+    const [namespace, key, originalType] = definition.split("___");
+    const results = await Promise.all(productIds.map(async (productId) => {
+      try {
+        const res = await admin.graphql(`
+          query getMetafield($ownerId: ID!, $namespace:  Single_line_text_field!, $key:  Single_line_text_field!) {
+            node(id: $ownerId) {
+              ... on Product {
+                metafield(namespace: $namespace, key: $key) {
+                  value
+                }
+              }
+            }
+          }
+        `, {
+          variables: {
+            ownerId: productId,
+            namespace,
+            key,
+          },
+        });
+        const data = await res.json();
+        const value = data?.data?.node?.metafield?.value;
+        return { productId, value };
+      } catch (err) {
+        return { productId, value: null };
+      }
+    }));
+    const values = {};
+    for (const { productId, value } of results) values[productId] = value;
+    return json({ success: true, values, originalType, intent });
   }
 
-  return json({
-    success: errors.length === 0,
-    message: summaryMessage,
-    errors,
-    processedRowsCount,
-    updatedCollectionsCount,
-    updatedMetafieldsCount,
-    importedFileName: file.name,
-  }, { status: errors.length > 0 ? 400 : 200 });
-};
+  // SINGLE GET (for initial single product mode)
+  if (intent === "getMetafieldValue") {
+    const productId = form.get("productId");
+    const definition = form.get("definition");
 
-// Helper functions
-function isValidJson(str) {
-  try {
-    JSON.parse(str);
-  } catch (e) {
-    return false;
+    if (!productId || !definition) {
+      return json({ success: false, errors: [{ message: "Product ID and definition are required to fetch metafield." }], intent: "getMetafieldValue" });
+    }
+
+    const [namespace, key, originalType] = definition.split("___");
+
+    try {
+      const res = await admin.graphql(`
+        query getMetafield($ownerId: ID!, $namespace:  Single_line_text_field!, $key:  Single_line_text_field!) {
+          node(id: $ownerId) {
+            ... on Product {
+              metafield(namespace: $namespace, key: $key) {
+                value
+              }
+            }
+          }
+        }
+      `, {
+        variables: {
+          ownerId: productId,
+          namespace,
+          key,
+        },
+      });
+
+      const data = await res.json();
+      const metafieldValue = data?.data?.node?.metafield?.value;
+
+      return json({ success: true, value: metafieldValue, originalType, intent: "getMetafieldValue" });
+    } catch (err) {
+      console.error("Metafield fetch error:", err);
+      return json({
+        success: false,
+        errors: [{ message: "Server error during metafield fetch." }],
+        intent: "getMetafieldValue",
+      });
+    }
   }
-  return true;
+
+  // ─────────────────────────────────────────
+  // CLEAR METAFIELD VALUE (scalar types)
+  // ─────────────────────────────────────────
+  if (intent === "clearMetafield") {
+    const productId = form.get("productId");
+    const definition = form.get("definition"); // "namespace___key"
+    if (!productId || !definition) {
+      return json({
+        success: false,
+        errors: [{ message: "Product ID and definition required." }],
+        intent
+      }, { status: 400 });
+    }
+
+    const [namespace, key] = definition.split("___");
+
+    // 🔄 Use ownerId + namespace + key instead of ID
+    const delRes = await admin.graphql(`
+      mutation ($metafields: [MetafieldIdentifierInput!]!) {
+        metafieldsDelete(metafields: $metafields) {
+          userErrors { field message }
+        }
+      }
+    `, {
+      variables: {
+        metafields: [{ ownerId: productId, namespace, key }]
+      }
+    });
+
+    const delData = await delRes.json();
+    const errs = delData?.data?.metafieldsDelete?.userErrors || [];
+
+    if (errs.length) {
+      return json({ success: false, errors: errs, intent, productId });
+    }
+
+    return json({ success: true, intent, productId });
+  }
+
+  return json({ success: false, errors: [{ message: "Invalid action intent." }] });
 }
 
-function isValidUrl(str) {
-  try {
-    new URL(str);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-export default function Collections() {
-  const { collections, error: loaderError } = useLoaderData();
+// NEW: CreateMetafieldDefinitionModal component
+function CreateMetafieldDefinitionModal({ isOpen, onClose, onSubmit, isSubmitting, errors }) {
   const actionData = useActionData();
   const navigation = useNavigation();
-  const fetcher = useFetcher();
+  const submitting = navigation.state === "submitting";
 
-  const [fileName, setFileName] = useState("");
-  const [toastActive, setToastActive] = useState(false);
-  const [toastContent, setToastContent] = useState("");
-  const [toastError, setToastError] = useState(false);
-  const [importErrors, setImportErrors] = useState([]);
+  const [namespace, setNamespace] = useState("");
+  const [key, setKey] = useState("");
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [type, setType] = useState("single_line_text_field");
 
-  useEffect(() => {
-    if (loaderError) {
-      setToastContent(`Error loading collections: ${loaderError}`);
-      setToastError(true);
-      setToastActive(true);
-    }
-  }, [loaderError]);
-
-  const handleDownload = useCallback(async () => {
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet("Collections");
-
-    // Extract unique metafield keys and their *defined types* from the loaded collections
-    const uniqueMetafields = new Map(); // key -> {key, type}
-    collections.forEach(col => {
-      col.metafields.nodes.forEach(mf => {
-        if (!uniqueMetafields.has(mf.key)) {
-          uniqueMetafields.set(mf.key, { key: mf.key, type: mf.type });
-        }
-      });
-    });
-
-    const metafieldKeysAndTypes = Array.from(uniqueMetafields.values()).sort((a, b) => a.key.localeCompare(b.key));
-    const metafieldHeaders = metafieldKeysAndTypes.map(mt => mt.key);
-
-    const headers = [
-      "Collection ID",      // Column A (GID)
-      "Title",              // Column B
-      "Description",        // Column C
-      "Sort Order",         // Column D
-      "Template Suffix",    // Column E
-      ...metafieldHeaders,  // Start from Column F
-    ];
-    worksheet.addRow(headers);
-
-    collections.forEach((col, idx) => {
-      if (!col.id || !col.id.startsWith('gid://shopify/Collection/')) {
-        console.warn(`Collection at index ${idx} has a non-GID ID in loader data: ${col.id}. This indicates a data integrity issue or unexpected API response.`);
-      }
-
-      const metafieldMap = {};
-      col.metafields.nodes.forEach(mf => {
-          // When exporting, use the `displayValue` which has GIDs resolved to titles
-          // BUT for `collection_reference` and `list.collection_reference`,
-          // we need to export the raw GID or JSON string of GIDs.
-          // This requires `loader` to pass the original `value` alongside `displayValue`.
-
-          // Let's modify the loader to pass original `mf.value`
-          // For now, if the `mf.type` is known, export the raw GID from mf.value, not displayValue.
-          if (mf.type === 'collection_reference' || mf.type === 'list.collection_reference' || mf.type === 'file_reference' || mf.type === 'image_reference') {
-             metafieldMap[mf.key] = mf.value || ""; // Export the raw GID(s) string
-          } else {
-             metafieldMap[mf.key] = mf.displayValue || ""; // Export the displayed value for other types
-          }
-      });
+  const metafieldOptions = Object.entries(typeMap).map(([label, _value]) => ({
+    label: label.replace(/_/g, " ").toLowerCase().replace(/^\w/, (c) => c.toUpperCase()),
+    value: label,
+  }));
 
 
-      const rowData = [
-        col.id, // Collection ID (Column A) - Should be GID
-        col.title, // Title (Column B)
-        col.descriptionHtml, // Description (Column C)
-        col.sortOrder || "", // Sort Order (Column D)
-        col.templateSuffix || "", // Template Suffix (Column E)
-        ...metafieldHeaders.map(key => metafieldMap[key] || ""), // Metafields (Starting from Column F)
-      ];
-      worksheet.addRow(rowData);
-    });
 
-    const buffer = await workbook.xlsx.writeBuffer();
-
-    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "shopify_collections_export.xlsx";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
-  }, [collections]);
-
-  const handleDrop = useCallback((files, acceptedFiles) => {
-    if (acceptedFiles.length > 0) {
-      const selectedFile = acceptedFiles[0];
-      const formData = new FormData();
-      formData.append("file", selectedFile);
-      setFileName(selectedFile.name);
-      setImportErrors([]);
-      fetcher.submit(formData, { method: "post", encType: "multipart/form-type" });
-    }
-  }, [fetcher]);
+  const handleSubmit = useCallback(() => {
+    onSubmit({ namespace, key, name, type: type, description }); // Pass the original API type
+  }, [namespace, key, name, type, description, onSubmit]);
 
   useEffect(() => {
-    if (fetcher.state === "submitting") {
-      setToastContent(`Importing ${fileName}... Please wait, this may take a moment.`);
-      setToastError(false);
-      setToastActive(true);
-      setImportErrors([]);
-    } else if (fetcher.state === "idle" && fetcher.data) {
-      if (fetcher.data.success) {
-        setToastContent(fetcher.data.message || "Import completed successfully.");
-        setToastError(false);
-        setToastActive(true);
-        setImportErrors([]);
-      } else {
-        setToastContent(fetcher.data.error || "Import failed. Check error details below.");
-        setToastError(true);
-        setToastActive(true);
-        if (fetcher.data.errors && Array.isArray(fetcher.data.errors)) {
-          setImportErrors(fetcher.data.errors);
-        } else if (fetcher.data.details) {
-            setImportErrors([{ row: 'N/A', message: fetcher.data.details }]);
-        }
-      }
+    if (!isOpen) {
+      setNamespace("");
+      setKey("");
+      setName("");
+      setType("single_line_text_field");
+      setDescription("");
     }
-  }, [fetcher.data, fetcher.state, fileName]);
-
-  useEffect(() => {
-    if (fetcher.state === "idle" && fetcher.data?.success) {
-      fetcher.load('/collections'); // Reload collections after successful import
-    }
-  }, [fetcher.data, fetcher.state, fetcher.load]);
-
-  const toggleToastActive = useCallback(() => setToastActive(active => !active), []);
-
-  const loading = navigation.state === "submitting" || fetcher.state === "submitting" || fetcher.state === "loading";
-
-  const rows = collections.map(col => [
-    col.title,
-    col.handle,
-    col.metafields?.nodes?.length || 0,
-    new Date(col.updatedAt).toLocaleDateString(),
-  ]);
+  }, [isOpen]);
 
   return (
-    <Page title="Collections Export/Import">
-      <TitleBar title="Collections Export/Import" />
-      <Layout>
-        <Layout.Section>
-          <Card sectioned>
-            <LegacyStack spacing="tight" vertical>
-              <Text variant="headingMd" as="h2">Export Collections to Excel</Text>
-              <Text variant="bodyMd" as="p">Download all your Shopify collections, including their core fields and custom metafields, into an Excel file. This file can then be updated and re-imported.</Text>
-              <Button onClick={handleDownload} primary disabled={loading}>
-                Export Collections ({collections.length} total)
-              </Button>
-            </LegacyStack>
-          </Card>
-
-          <Card sectioned title="Import Updated Excel File">
-            <LegacyStack spacing="tight" vertical>
-              <Text variant="bodyMd" as="p">
-                Upload an Excel file (exported from this app) to update existing collections and their metafields.
-                <br/>
-                <List type="bullet">
-                  <List.Item>
-                    **Crucial:** The first column (**Column A**) in your Excel file **must** contain the Shopify Global ID (`gid://shopify/Collection/123...`) for each collection.
-                  </List.Item>
-                  <List.Item>
-                    The second column (**Column B**) is expected to be the Collection `Title`.
-                  </List.Item>
-                  <List.Item>
-                    New metafield keys found in the Excel header (starting from **Column F**) will be created in the `custom` namespace with `single_line_text_field` type.
-                  </List.Item>
-                  <List.Item>
-                    **Important for Metafields:** The import logic now attempts to use the metafield's defined type from Shopify. For reference types (`collection_reference`, `list.collection_reference`, `file_reference`, `image_reference`), the exported Excel will contain the raw GID(s). For `list.collection_reference`, the value must be a JSON array string of GIDs (e.g., `["gid://...","gid://..."]`).
-                  </List.Item>
-                  <List.Item>
-                    **Please ensure any incomplete GIDs like `gid://shc` are corrected to full, valid Shopify GIDs or left empty in your Excel file.**
-                  </List.Item>
-                </List>
+    <Modal
+      open={isOpen}
+      onClose={onClose}
+      title="Create New Metafield Definition"
+      primaryAction={{
+        content: "Create",
+        onAction: handleSubmit,
+        loading: isSubmitting,
+        disabled: isSubmitting || !namespace || !key || !name || !type,
+      }}
+      secondaryActions={[
+        {
+          content: "Cancel",
+          onAction: onClose,
+          disabled: isSubmitting,
+        },
+      ]}
+    >
+      <Modal.Section>
+        <Form onSubmit={handleSubmit}>
+          <FormLayout>
+            {errors && errors.length > 0 && (
+              <Text color="critical" as="p">
+                {errors.map((error, idx) => (
+                  <span key={idx}>{error.message}</span>
+                ))}
               </Text>
-              <DropZone allowMultiple={false} onDrop={handleDrop} disabled={loading} accept=".xlsx">
-                {fileName ? <Text>Selected file: {fileName}</Text> : <DropZone.FileUpload actionHint="Accepts .xlsx files only" />}
-              </DropZone>
-              {loading && <Text alignment="center" variant="bodyMd">Processing import... This may take a moment.</Text>}
-            </LegacyStack>
-          </Card>
-
-          {importErrors.length > 0 && (
-            <Layout.Section>
-              <Card sectioned title="Import Errors Detected">
-                <LegacyStack vertical spacing="tight">
-                  <Text color="critical" variant="headingSm">The following issues were found during the import:</Text>
-                  <DataTable
-                    columnContentTypes={["text", "text"]}
-                    headings={["Row #", "Error Message"]}
-                    rows={importErrors.map(err => [err.row || 'N/A', err.message])}
-                  />
-                  <Text>Please correct these issues in your Excel file and try re-importing.</Text>
-                </LegacyStack>
-              </Card>
-            </Layout.Section>
-          )}
-        </Layout.Section>
-
-        {collections.length > 0 && (
-          <Layout.Section>
-            <Card title={`Existing Collections (${collections.length})`} sectioned>
-              <DataTable
-                columnContentTypes={["text", "text", "numeric", "text"]}
-                headings={["Title", "Handle", "Metafields Count", "Updated At"]}
-                rows={rows}
-              />
+            )}
+            <TextField
+              label="Namespace"
+              value={namespace}
+              onChange={setNamespace}
+              helpText="e.g., 'my_app' or 'custom'"
+              autoComplete="off"
+              requiredIndicator
+            />
+            <TextField
+              label="Key"
+              value={key}
+              onChange={setKey}
+              helpText="e.g., 'product_info' or 'product_pdf'"
+              autoComplete="off"
+              requiredIndicator
+            />
+            <TextField
+              label="Name"
+              value={name}
+              onChange={setName}
+              helpText="Display name for the metafield (e.g., 'Product Information')"
+              autoComplete="off"
+              requiredIndicator
+            />
+            <Select
+              label="Type"
+              options={metafieldOptions}
+              onChange={setType}
+              value={type}
+              helpText="Choose the data type for your metafield."
+              requiredIndicator
+            />
+            <TextField
+              label="Description (Optional)"
+              value={description}
+              onChange={setDescription}
+              multiline
+              autoComplete="off"
+            />
+            {actionData?.success && (
+            <Card sectioned>
+              <Text variant="headingMd">
+                ✅ Metafield created successfully!
+              </Text>
             </Card>
-          </Layout.Section>
-        )}
-      </Layout>
-
-      {toastActive && (
-        <Frame>
-          <Toast content={toastContent} error={toastError} onDismiss={toggleToastActive} duration={5000} />
-        </Frame>
-      )}
-    </Page>
+          )}
+          </FormLayout>
+        </Form>
+      </Modal.Section>
+    </Modal>
   );
+}
+
+// Converts 2D array of [specification, value] rows into HTML table string
+function generateTableHTML(tableData) {
+  let html = "<table>";
+  html += "<thead><tr><th>Specification</th><th>Value</th></tr></thead><tbody>";
+  for (const row of tableData) {
+    html += `<tr><td>${row[0] || ""}</td><td>${row[1] || ""}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  return html;
+}
+
+// TableBuilder UI component
+function TableBuilder({ data, onChange }) {
+  const addRow = () => onChange([...data, ["", ""]]);
+  const removeRow = (idx) => {
+    if (data.length <= 1) return;
+    onChange(data.filter((_, i) => i !== idx));
+  };
+  const updateCell = (rowIdx, colIdx, val) => {
+    const updated = data.map((row, i) =>
+      i === rowIdx ? row.map((cell, j) => (j === colIdx ? val : cell)) : row
+    );
+    onChange(updated);
+  };
+
+  return (
+    <div style={{ overflowX: "auto", maxWidth: "100%" }}>
+      <table style={{ borderCollapse: "collapse", width: "100%" }}>
+        <thead>
+          <tr>
+            <th style={{ border: "1px solid #ccc", padding: 6 }}>Specification</th>
+            <th style={{ border: "1px solid #ccc", padding: 6 }}>Value</th>
+            <th></th> {/* For remove button */}
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((row, idx) => (
+            <tr key={idx}>
+              {[0, 1].map((colIdx) => (
+                <td key={colIdx} style={{ border: "1px solid #ccc", padding: 6, minWidth: 100 }}>
+                  <input
+                    type="text"
+                    value={row[colIdx]}
+                    onChange={(e) => updateCell(idx, colIdx, e.target.value)}
+                    style={{ width: "100%", border: "none", outline: "none" }}
+                  />
+                </td>
+              ))}
+              <td>
+                <button
+                  type="button"
+                  onClick={() => removeRow(idx)}
+                  disabled={data.length <= 1}
+                  style={{ cursor: data.length <= 1 ? "not-allowed" : "pointer" }}
+                  title="Remove Row"
+                >
+                  −
+                </button>
+              </td>
+            </tr>
+          ))}
+          <tr>
+            <td colSpan={3} style={{ textAlign: "left", paddingTop: 6 }}>
+              <button type="button" onClick={addRow}>＋ Add Row</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+
+
+
+
+
+export default function ProductMetafieldEditor() {
+  const { products, definitions } = useLoaderData();
+  const fetcher = useFetcher();
+  const definitionFetcher = useFetcher(); // New fetcher for definition creation
+  const fileInputRef = useRef(null);
+
+  // MULTI PRODUCT SELECTION
+  const [productSearch, setProductSearch] = useState("");
+  const [selectedProductIds, setSelectedProductIds] = useState([]);
+  const [selectedDef, setSelectedDef] = useState("");
+  const [metafieldValues, setMetafieldValues] = useState({});
+  const [listValues, setListValues] = useState({});
+  const [uploading, setUploading] = useState(false);
+  const [bulkValue, setBulkValue] = useState("");
+  const [bulkListValue, setBulkListValue] = useState([""]);
+  const [successMap, setSuccessMap] = useState({});
+  const [errorMap, setErrorMap] = useState({});
+  const [uploadProductId, setUploadProductId] = useState(null);
+
+  // NEW: Metafield Definition Creation State
+  const [showCreateModal, setShowCreateModal] = useState(false);
+
+  // Add inside ProductMetafieldEditor component, near your other useState calls
+  const [multiTextModeByProduct, setMultiTextModeByProduct] = useState({});
+  const [tableDataByProduct, setTableDataByProduct] = useState({});
+
+  // Bulk input mode for multiline text metafields: "plain" or "html" (table)
+  const [bulkMultiTextMode, setBulkMultiTextMode] = useState("plain");
+
+// Bulk table data for HTML mode: array of rows, each row is [specification, value]
+  const [bulkTableData, setBulkTableData] = useState([["", ""]]);
+
+
+  
+
+  // AUTOCOMPLETE MULTI for Products
+  const productOptions = useMemo(
+    () => products.map((product) => ({ label: product.title, value: product.id })),
+    [products]
+  );
+  // Filter out already-selected products from options + add "Select All"
+  const filteredProductOptions = useMemo(() => {
+    let options = productOptions.filter(opt => !selectedProductIds.includes(opt.value));
+
+    // Add "Select All Products" option
+    const selectAllOption = { label: "Select All Products", value: "ALL" };
+    if (productSearch.toLowerCase() === "all" || productSearch === "") {
+      options = [selectAllOption, ...options];
+    } else {
+      options = options.filter(
+        (option) => option.label.toLowerCase().includes(productSearch.toLowerCase())
+      );
+    }
+    return options.slice(0, 20); // Limit to top 20 suggestions
+  }, [productSearch, productOptions, selectedProductIds]);
+
+  // DEFINITION options (now using Polaris Select)
+ // 🔹 1. Memoize the raw definition options
+const definitionOptions = useMemo(() => {
+  const opts = definitions.map((def) => ({
+    label: `${def.name} (${def.namespace}.${def.key}) - ${def.type.replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase())}`,
+    value: `${def.namespace}___${def.key}___${def.originalType}`,
+    type: def.type,
+    originalType: def.originalType,
+  }));
+  return [{ label: "Select a metafield definition", value: "", disabled: true }, ...opts];
+}, [definitions]);
+
+
+// 🔹 2. Create search state and filtered options outside of useMemo
+const [defSearch, setDefSearch] = useState("");
+
+const filteredDefs = useMemo(() => {
+  return definitionOptions.filter(def =>
+    def.label.toLowerCase().includes(defSearch.toLowerCase())
+  );
+}, [definitionOptions, defSearch]);
+
+
+// 🔹 3. Extract selected definition type
+const selectedDefObj = definitionOptions.find((d) => d.value === selectedDef);
+const selectedType = selectedDefObj?.type || "";
+const selectedOriginalType = selectedDefObj?.originalType || "";
+const isListType = selectedType.startsWith("list.");
+const isJsonType = selectedType === "json";
+const isFileType = selectedType === "file_reference";
+
+
+
+  // FETCH VALUES WHEN SELECTION CHANGES
+  useEffect(() => {
+    if (selectedProductIds.length && selectedDef) {
+      fetcher.submit(
+        {
+          intent: "getMetafieldValuesBulk",
+          productIds: JSON.stringify(selectedProductIds),
+          definition: selectedDef,
+        },
+        { method: "post", action: "." }
+      );
+    } else {
+      setMetafieldValues({});
+      setListValues({});
+      setSuccessMap({});
+      setErrorMap({});
+    }
+  }, [selectedProductIds, selectedDef]);
+
+  // SET VALUES FROM FETCHER
+  useEffect(() => {
+    if (fetcher.data?.success && fetcher.data?.intent === "getMetafieldValuesBulk") {
+      const fetched = fetcher.data.values || {};
+      const newValues = {};
+      const newListValues = {};
+      for (const pid of selectedProductIds) {
+        const v = fetched[pid];
+        if (isListType || (isJsonType && Array.isArray(v))) {
+          try {
+            const arr = JSON.parse(v);
+            newListValues[pid] = Array.isArray(arr) && arr.length > 0 ? arr : [""];
+            newValues[pid] = "";
+          } catch {
+            newListValues[pid] = [v];
+            newValues[pid] = "";
+          }
+        } else {
+          newValues[pid] = v || "";
+          newListValues[pid] = [""];
+        }
+      }
+      setMetafieldValues(newValues);
+      setListValues(newListValues);
+    }
+  }, [fetcher.data, isListType, isJsonType, selectedProductIds]);
+
+  // HANDLE PRODUCT MULTI SELECT
+  const handleProductSelect = useCallback(
+    (selected) => {
+      if (selected.includes("ALL")) {
+        setSelectedProductIds(productOptions.map(p => p.value)); // Select all available products
+      } else {
+        setSelectedProductIds((prev) => Array.from(new Set([...prev, ...selected])));
+      }
+      setProductSearch("");
+    },
+    [productOptions]
+  );
+  const handleRemoveProduct = (pid) => {
+    setSelectedProductIds((prev) => prev.filter((id) => id !== pid));
+    setMetafieldValues((prev) => {
+      const copy = { ...prev };
+      delete copy[pid];
+      return copy;
+    });
+    setListValues((prev) => {
+      const copy = { ...prev };
+      delete copy[pid];
+      return copy;
+    });
+    setSuccessMap((prev) => {
+      const copy = { ...prev };
+      delete copy[pid];
+      return copy;
+    });
+    setErrorMap((prev) => {
+      const copy = { ...prev };
+      delete copy[pid];
+      return copy;
+    });
+  };
+
+  // HANDLE VALUE CHANGE
+  const handleValueChange = (productId, val) => {
+    setMetafieldValues((prev) => ({ ...prev, [productId]: val }));
+  };
+  const handleListValueChange = (productId, idx, val) => {
+    setListValues((prev) => {
+      const arr = [...(prev[productId] || [""])];
+      arr[idx] = val;
+      return { ...prev, [productId]: arr };
+    });
+  };
+  const handleAddListItem = (productId) => {
+    setListValues((prev) => ({
+      ...prev,
+      [productId]: [...(prev[productId] || [""]), ""],
+    }));
+  };
+  const handleRemoveListItem = (productId, idx) => {
+    setListValues((prev) => {
+      const arr = [...(prev[productId] || [""])];
+      arr.splice(idx, 1);
+      return { ...prev, [productId]: arr.length > 0 ? arr : [""] };
+    });
+  };
+
+ const handleBulkSet = () => {
+  // 1. Handle multiline text field with HTML table input mode first
+  
+  if (selectedType === "multi_line_text_field" && bulkMultiTextMode === "html") {
+    const newTableDataByProduct = { ...tableDataByProduct };
+    const newMultiTextModeByProduct = { ...multiTextModeByProduct };
+
+    selectedProductIds.forEach(pid => {
+      newTableDataByProduct[pid] = bulkTableData;
+      newMultiTextModeByProduct[pid] = "html";
+    });
+
+    setTableDataByProduct(newTableDataByProduct);
+    setMultiTextModeByProduct(newMultiTextModeByProduct);
+
+    console.log("Bulk set HTML table data and mode for products:", newTableDataByProduct, newMultiTextModeByProduct);
+    return; // exit early, done with bulk setting
+  }
+
+  // 2. Handle list or JSON types
+  const bulkItems = bulkListValue.filter(v => v && v.trim() !== "");
+  
+  if (isListType || (isJsonType && Array.isArray(bulkItems))) {
+    console.log("Inside list/json type block");
+
+    const updatedListValues = {};
+
+    selectedProductIds.forEach(pid => {
+      // Filter existing list values to valid, non-empty strings before processing
+      const existing = (listValues[pid] || []).filter(
+        item => typeof item === "string" && item.trim() !== ""
+      );
+
+      console.log(`Processing PID: ${pid}, Existing (filtered):`, existing);
+
+      if (existing.length > 0) {
+        // Append bulk items to existing list for this product
+        console.log("Appending to existing list");
+        updatedListValues[pid] = [...existing, ...bulkItems];
+      } else {
+        // No valid existing list items; assign bulk items directly
+        console.log("Assigning bulk items directly (no existing valid values)");
+        updatedListValues[pid] = [...bulkItems];
+      }
+    });
+
+    console.log("updatedListValues before setListValues:", updatedListValues);
+    setListValues(updatedListValues);
+  } else {
+    // 3. For scalar or plain multiline text types: assign bulkValue per product
+    console.log("Inside non-list/json type block");
+
+    const newVals = {};
+    selectedProductIds.forEach(pid => {
+      newVals[pid] = bulkValue;
+    });
+
+    console.log("newVals before setMetafieldValues:", newVals);
+    setMetafieldValues(newVals);
+  }
+};
+
+  // FILE UPLOAD
+  const handleFileChange = async (e, productId) => {
+    const file = e.target.files[0];
+    if (file) {
+      setUploading(true);
+      setUploadProductId(productId);
+      handleValueChange(productId, "Uploading..."); // Show uploading status in the text field
+      const formData = new FormData();
+      formData.append("file", file);
+      fetcher.submit(formData, { method: "post", encType: "multipart/form-data" });
+    }
+  };
+  // Set uploaded file URL to correct product
+  useEffect(() => {
+    if (
+      fetcher.data?.intent === "uploadFile" &&
+      fetcher.data?.success &&
+      uploadProductId
+    ) {
+      handleValueChange(uploadProductId, fetcher.data.url);
+      setUploading(false);
+      setUploadProductId(null);
+    }
+    if (fetcher.data?.intent === "uploadFile" && !fetcher.data?.success) {
+      setUploading(false);
+      setUploadProductId(null);
+      alert(fetcher.data.error || "Failed to upload file.");
+    }
+    // eslint-disable-next-line
+  }, [fetcher.data, uploadProductId]);
+
+  const handleBulkSubmit = (e) => {
+  e.preventDefault();
+
+  // Prepare update payload for each selected product
+  const updates = selectedProductIds.map(pid => {
+    let value = "";
+
+    // Handle multi_line_text_field in "html" mode (table input)
+    if (selectedType === "multi_line_text_field" && multiTextModeByProduct[pid] === "html") {
+  value = generateTableHTML(tableDataByProduct[pid] || [["", ""]]);
+}
+    // Handle Shopify LIST types or JSON lists
+    else if (
+      isListType ||
+      (isJsonType && Array.isArray(listValues[pid]) && selectedOriginalType.startsWith("LIST."))
+    ) {
+      const rawList = listValues[pid] || [""];
+      const cleanList = rawList.filter(v => v !== null && v.trim() !== "");
+      // Send stringified JSON array, empty array if no valid items
+      value = JSON.stringify(cleanList.length > 0 ? cleanList : []);
+    }
+    // Handle general JSON types (non-list JSON)
+    else if (isJsonType) {
+      value = metafieldValues[pid] ?? bulkValue ?? "";
+      try {
+        // Validate that value is valid JSON; if not, reset to empty string
+        value = JSON.stringify(JSON.parse(value));
+      } catch (err) {
+        console.warn("Invalid JSON for product", pid, ":", value);
+        value = "";
+      }
+    }
+    // Handle scalar types (string, integer, color, boolean, etc.)
+    else {
+      value = metafieldValues[pid] ?? bulkValue ?? "";
+    }
+
+    return { productId: pid, value };
+  });
+
+  // Filter to allow all list/JSON updates, but ignore empty scalar values
+  const filteredUpdates = updates.filter(({ value }) => {
+    if (isListType || (isJsonType && selectedOriginalType.startsWith("LIST."))) {
+      return true; // accept all JSON lists (even empty arrays)
+    }
+    if (isJsonType) {
+      return true; // accept all JSON, backend handles validation
+    }
+    // For scalar types, ignore empty or null values
+    return value !== "" && value !== null && value !== undefined;
+  });
+
+  if (filteredUpdates.length === 0 && selectedDef) {
+    alert("No valid metafield values to save for the selected definition and products. All values are empty or invalid.");
+    return;
+  }
+
+  // Submit updates (you can switch to filteredUpdates here if you want to only submit valid entries)
+  fetcher.submit(
+    {
+      intent: "updateMetafieldsBulk",
+      definition: selectedDef,
+      updates: JSON.stringify(updates),
+    },
+    { method: "post", action: "." }
+  );
+};
+  // PER-ROW SUBMIT
+const handleRowUpdate = (productId) => {
+  let value = "";
+
+  // Handle multiline_text_field with "html" input mode (Table Builder)
+  if (selectedType === "multi_line_text_field" && multiTextModeByProduct[productId] === "html") {
+    const tableData = tableDataByProduct[productId] || [["", ""]];
+    value = generateTableHTML(tableData); // Convert table data to HTML string
+  } else if (isListType || (isJsonType && Array.isArray(listValues[productId]) && selectedOriginalType.startsWith("LIST."))) {
+    const rawList = listValues[productId] || [""];
+    const cleanList = rawList.filter(v => v !== null && v.trim() !== "");
+    value = JSON.stringify(cleanList.length > 0 ? cleanList : []); // Ensure empty array if all empty
+  } else if (isJsonType && metafieldValues[productId]) {
+    value = metafieldValues[productId];
+    try {
+      value = JSON.stringify(JSON.parse(value));
+    } catch (e) {
+      alert("Invalid JSON format for this metafield.");
+      return;
+    }
+  } else {
+    value = metafieldValues[productId] || "";
+  }
+
+  if (!value && !(isListType || isJsonType)) { // For scalar types, prompt before clearing
+    if (confirm("Value is empty. Do you want to clear this metafield for this product?")) {
+      handleRowClear(productId);
+    }
+    return;
+  }
+
+  fetcher.submit(
+    {
+      intent: "updateMetafield",
+      productId,
+      definition: selectedDef,
+      value,
+    },
+    { method: "post", action: "." }
+  );
+};
+
+
+const handleRowClear = (productId) => {
+  fetcher.submit(
+    {
+      intent: "clearMetafield",
+      productId,
+      definition: selectedDef, // "namespace___key___originalType"
+    },
+    { method: "post", action: "." }
+  );
+};
+
+
+// Success/error feedback per row
+useEffect(() => {
+  if (fetcher.data?.intent === "updateMetafieldsBulk" && fetcher.data?.results) {
+    const s = {}, e = {};
+    fetcher.data.results.forEach(r => {
+      if (r.success) s[r.productId] = true;
+      else e[r.productId] = r.errors?.map(x => x.message).join(", ") || "Error";
+    });
+    setSuccessMap(s);
+    setErrorMap(e);
+  }
+  if (fetcher.data?.intent === "updateMetafield" && fetcher.data?.productId) {
+    if (fetcher.data.success) setSuccessMap((prev) => ({ ...prev, [fetcher.data.productId]: true }));
+    else setErrorMap((prev) => ({ ...prev, [fetcher.data.productId]: fetcher.data.errors?.map(x => x.message).join(", ") || "Error" }));
+  }
+
+  if (fetcher.data?.intent === "clearMetafield" && fetcher.data?.productId) {
+    const pid = fetcher.data.productId;
+    if (fetcher.data.success) {
+      setMetafieldValues(prev => ({ ...prev, [pid]: "" }));
+      setListValues(prev => ({ ...prev, [pid]: [""] }));
+      setSuccessMap(prev => ({ ...prev, [pid]: true }));
+      setErrorMap(prev => ({ ...prev, [pid]: undefined }));
+    } else {
+      setErrorMap(prev => ({
+        ...prev,
+        [pid]: fetcher.data.errors?.map(e => e.message).join(", ") || "Error",
+      }));
+    }
+  }
+}, [fetcher.data]);
+
+
+// Handle Definition Creation feedback
+useEffect(() => {
+  if (definitionFetcher.data?.intent === "createMetafieldDefinition") {
+    if (definitionFetcher.data.success) {
+      setShowCreateModal(false);
+      // Optionally refresh definitions here, or reload page if needed
+    } else {
+      alert(definitionFetcher.data.errors?.map(e => e.message).join(", ") || "Failed to create metafield definition.");
+    }
+  }
+}, [definitionFetcher.data]);
+
+
+useEffect(() => {
+  if (selectedDef) {
+    const selectedObj = definitionOptions.find(d => d.value === selectedDef);
+    if (selectedObj) {
+      setDefSearch(selectedObj.label);
+    }
+  } else {
+    setDefSearch("");
+  }
+}, [selectedDef, definitionOptions]);
+
+
+  // Handle Definition Creation feedback
+  useEffect(() => {
+    if (definitionFetcher.data?.intent === "createMetafieldDefinition") {
+      if (definitionFetcher.data.success) {
+        setShowCreateModal(false);
+        // Optionally, refresh the page or update definitions in state to show new def
+        // For simplicity, we can reload definitions by submitting to loader.
+        // This is not ideal for large numbers of definitions, but works for now.
+        // A better approach would be to add the new definition to the 'definitions' state directly.
+        // As remix loader doesn't re-run on action, for simplicity, we'll suggest a full reload for now.
+         // Simple but effective refresh
+        // Alternatively, if you want to avoid full reload:
+        // setDefinitions(prev => [...prev, definitionFetcher.data.definition]);
+      } else {
+        alert(definitionFetcher.data.errors?.map(e => e.message).join(", ") || "Failed to create metafield definition.");
+      }
+    }
+  }, [definitionFetcher.data]);
+
+  useEffect(() => {
+  if (selectedDef) {
+    const selectedObj = definitionOptions.find(d => d.value === selectedDef);
+    if (selectedObj) {
+      setDefSearch(selectedObj.label);
+    }
+  } else {
+    setDefSearch(""); // or keep empty when none selected
+  }
+}, [selectedDef, definitionOptions]);
+
+
+return (
+  <Page title="🚧 Metafield Workbench">
+    <Layout>
+      <Layout.Section>
+        <Card sectioned spacing="loose">
+          <form onSubmit={handleBulkSubmit}>
+            {/* Selected Products as Chips */}
+            {selectedProductIds.length > 0 && (
+              <div style={{ marginBottom: "1rem", display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                {selectedProductIds.map(pid => {
+                  const product = productOptions.find(p => p.value === pid);
+                  return (
+                    <span
+                      key={pid}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        background: "linear-gradient(90deg, #f8f9f8ff 0%, #efcdf8ff 100%)",
+                        color: "#1e293b",
+                        fontWeight: 600,
+                        borderRadius: "16px",
+                        padding: "6px 14px 6px 12px",
+                        fontSize: "12px",
+                        boxShadow: "0 2px 6px #fbbf2430",
+                        border: "1px solid #f59e42",
+                        marginRight: "4px",
+                      }}
+                    >
+                      {product?.label}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveProduct(pid)}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "#d97706",
+                          fontWeight: "bold",
+                          fontSize: "15px",
+                          marginLeft: "8px",
+                          cursor: "pointer",
+                          lineHeight: 1,
+                        }}
+                        title="Remove"
+                        aria-label="Remove"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Product Multi-Select */}
+            <div style={{ marginBottom: "1.5rem" }}>
+              <Autocomplete
+                options={filteredProductOptions}
+                selected={[]}
+                onSelect={handleProductSelect}
+                allowMultiple
+                textField={
+                  <Autocomplete.TextField
+                    label="Search Products"
+                    value={productSearch}
+                    onChange={setProductSearch}
+                    placeholder="Search Product Name"
+                    autoComplete="off"
+                  />
+                }
+              />
+            </div>
+
+            {/* Definition Dropdown */}
+            <div style={{ marginBottom: "1.5rem", display: 'flex', alignItems: 'flex-end', gap: '1rem' }}>
+              <div style={{ flexGrow: 1 }}>
+                <Autocomplete
+                  options={filteredDefs}
+                  selected={selectedDef ? [selectedDef] : []}
+                  onSelect={(selected) => {
+                    setSelectedDef(selected[0] || "");
+                    setDefSearch("");
+                    // Clear related states as needed
+                    setMetafieldValues({});
+                    setListValues({});
+                    setSuccessMap({});
+                    setErrorMap({});
+                  }}
+                  textField={
+                    <Autocomplete.TextField
+                      label="Metafield Definition"
+                      value={defSearch}
+                      onChange={setDefSearch}
+                      placeholder="Search metafield definitions"
+                      clearButton
+                      onClearButtonClick={() => setDefSearch("")}
+                      autoComplete="off"
+                    />
+                  }
+                />
+              </div>
+              <Button onClick={() => setShowCreateModal(true)}>
+                Create New Definition
+              </Button>
+            </div>
+
+            {/* Bulk Set */}
+            {selectedProductIds.length > 1 && selectedDef && (
+              <div style={{ marginBottom: "1.5rem" }}>
+                <Text as="p" variant="bodyMd" style={{ fontWeight: 700, color: "#97530bff", marginBottom: 8 }}>
+                  Bulk set value for all selected products:
+                </Text>
+
+                {selectedType === "multi_line_text_field" ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                    {/* Bulk Input Mode Selector */}
+                    <Select
+                      label="Bulk Input Mode"
+                      options={[
+                        { label: "Plain Text", value: "plain" },
+                        { label: "HTML Table", value: "html" },
+                      ]}
+                      value={bulkMultiTextMode}
+                      onChange={(val) => {
+                        setBulkMultiTextMode(val);
+                        if (val !== "html") {
+                          setBulkTableData([["", ""]]); // Reset table data for leaving html mode
+                        } else if (!bulkTableData || bulkTableData.length === 0) {
+                          setBulkTableData([["", ""]]); // Initialize for html mode
+                        }
+                      }}
+                    />
+
+                    {/* Plain Text Bulk Input */}
+                    {bulkMultiTextMode === "plain" && (
+                      <TextField
+                        label="Bulk Value (Plain Text)"
+                        value={bulkValue}
+                        onChange={setBulkValue}
+                        multiline
+                        autoComplete="off"
+                        fullWidth
+                        placeholder="Enter plain text here"
+                      />
+                    )}
+
+                    {/* HTML Table Bulk Input */}
+                    {bulkMultiTextMode === "html" && (
+                      <>
+                        <TableBuilder
+                          data={bulkTableData}
+                          onChange={setBulkTableData}
+                        />
+                        <TextField
+                          label="Generated HTML Preview"
+                          multiline
+                          readOnly
+                          autoComplete="off"
+                          value={generateTableHTML(bulkTableData)}
+                          helpText="This HTML markup will be saved as the bulk metafield value."
+                          style={{ marginTop: "12px", fontFamily: "monospace" }}
+                          fullWidth
+                        />
+                      </>
+                    )}
+                  </div>
+                ) : isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
+                  <>
+                    {bulkListValue.map((item, idx) => (
+                      <div key={idx} style={{
+                        display: "flex",
+                        alignItems: "center",
+                        marginBottom: "0.5rem",
+                        background: "#fffbe8",
+                        border: "1.5px solid #fde68a",
+                        borderRadius: "6px",
+                        padding: "0.5rem",
+                        boxShadow: "0 1px 8px #fde68a40"
+                      }}>
+                        <TextField
+                          value={item}
+                          onChange={val => {
+                            const arr = [...bulkListValue];
+                            arr[idx] = val;
+                            setBulkListValue(arr);
+                          }}
+                          multiline
+                          autoComplete="off"
+                          fullWidth
+                          label={idx === 0 ? <span style={{ color: "#5f2864ff", fontWeight: 700 }}>Bulk List Item</span> : undefined}
+                          labelHidden={idx !== 0}
+                          style={{
+                            fontWeight: 700,
+                            color: "#5e2a86ff",
+                            background: "transparent",
+                            border: "none",
+                            outline: "none"
+                          }}
+                        />
+                        {bulkListValue.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const arr = [...bulkListValue];
+                              arr.splice(idx, 1);
+                              setBulkListValue(arr.length ? arr : [""]);
+                            }}
+                            style={{
+                              backgroundColor: "#fde68a",
+                              color: "#fff",
+                              border: "none",
+                              width: "32px",
+                              height: "32px",
+                              borderRadius: "4px",
+                              cursor: "pointer",
+                              marginLeft: "8px",
+                              fontWeight: "bold",
+                              fontSize: "18px",
+                            }}
+                          >−</button>
+                        )}
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setBulkListValue([...bulkListValue, ""])}
+                      style={{
+                        background: "linear-gradient(90deg, #ece0b3ff 0%, #f6b4ccff 100%)",
+                        color: "#000000ff",
+                        border: "none",
+                        padding: "6px 12px",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                        marginTop: "0.5rem",
+                        fontWeight: 700,
+                        fontSize: "14px",
+                        boxShadow: "0 2px 6px #fde68a50"
+                      }}
+                    >＋ Add List Item</button>
+                  </>
+                ) : selectedType === "color" ? (
+                  <TextField
+                    label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value (Color)</span>}
+                    value={bulkValue}
+                    onChange={setBulkValue}
+                    type="color"
+                    autoComplete="off"
+                    fullWidth
+                    style={{
+                      fontWeight: 700,
+                      color: "#f59e42",
+                      background: "#fffbe8",
+                      border: "1.5px solid #fde68a",
+                      borderRadius: "6px",
+                      boxShadow: "0 1px 8px #fde68a40"
+                    }}
+                  />
+                ) : selectedType === "boolean" ? (
+                  <Select
+                    label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value (Boolean)</span>}
+                    options={[
+                      { label: "Select...", value: "" },
+                      { label: "True", value: "true" },
+                      { label: "False", value: "false" }
+                    ]}
+                    value={bulkValue}
+                    onChange={setBulkValue}
+                  />
+                ) : (
+                  <TextField
+                    value={bulkValue}
+                    onChange={setBulkValue}
+                    label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value</span>}
+                    autoComplete="off"
+                    fullWidth
+                    multiline={selectedType === "multi_line_text_field" || selectedType === "rich_text_field" || selectedType === "json"}
+                    type={selectedType === "integer" || selectedType === "float" ? "number" : "text"}
+                    style={{
+                      fontWeight: 700,
+                      color: "#f59e42",
+                      background: "#fffbe8",
+                      border: "1.5px solid #fde68a",
+                      borderRadius: "6px",
+                      boxShadow: "0 1px 8px #fde68a40"
+                    }}
+                  />
+                )}
+
+                <Button onClick={handleBulkSet} style={{
+                  marginTop: "0.5rem",
+                  background: "linear-gradient(90deg, #fde68a 0%, #fbbf24 100%)",
+                  color: "#b45309",
+                  fontWeight: 700,
+                  fontSize: "15px",
+                  border: "none",
+                  borderRadius: "6px",
+                  boxShadow: "0 2px 6px #fde68a50"
+                }}>
+                  Set All Values
+                </Button>
+              </div>
+            )}
+
+            {/* Table/List of Products */}
+            {selectedDef && selectedProductIds.length > 0 && (
+              <div style={{ marginBottom: "1.5rem" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Product</th>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Metafield Value</th>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Update</th>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedProductIds.map(pid => {
+                      const product = productOptions.find(p => p.value === pid);
+                      let value = metafieldValues[pid] || "";
+                      let listVal = listValues[pid] || [""];
+
+                      return (
+                        <tr key={pid} style={{ borderBottom: "1px solid #eee" }}>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            <Text as="span" variant="bodyMd">{product?.label}</Text>
+                          </td>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            {selectedType === "multi_line_text_field" ? (
+                              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                                {/* Input mode selector */}
+                                <Select
+                                  label="Input Mode"
+                                  options={[
+                                    { label: "Plain Text", value: "plain" },
+                                    { label: "HTML Table", value: "html" },
+                                  ]}
+                                  value={multiTextModeByProduct[pid] || "plain"}
+                                  onChange={(val) => {
+                                    setMultiTextModeByProduct(prev => ({ ...prev, [pid]: val }));
+                                    if (val !== "html") {
+                                      setTableDataByProduct(prev => {
+                                        const copy = { ...prev };
+                                        delete copy[pid];
+                                        return copy;
+                                      });
+                                    } else if (!tableDataByProduct[pid]) {
+                                      setTableDataByProduct(prev => ({ ...prev, [pid]: [["", ""]] }));
+                                    }
+                                  }}
+                                />
+                                {/* Plain text input */}
+                                {multiTextModeByProduct[pid] === "plain" && (
+                                  <TextField
+                                    label="Plain Text"
+                                    value={metafieldValues[pid] || ""}
+                                    onChange={(val) => handleValueChange(pid, val)}
+                                    multiline
+                                    autoComplete="off"
+                                    fullWidth
+                                    placeholder="Enter plain text here"
+                                  />
+                                )}
+                                {/* Table builder with live HTML preview */}
+                                {multiTextModeByProduct[pid] === "html" && (
+                                  <>
+                                    <TableBuilder
+                                      data={tableDataByProduct[pid] || [["", ""]]}
+                                      onChange={(newTable) => setTableDataByProduct(prev => ({ ...prev, [pid]: newTable }))}
+                                    />
+                                    <TextField
+                                      label="Generated HTML Preview"
+                                      multiline
+                                      readOnly
+                                      value={generateTableHTML(tableDataByProduct[pid] || [["", ""]])}
+                                      helpText="This HTML markup will be saved as the metafield value."
+                                      style={{ marginTop: "12px", fontFamily: "monospace" }}
+                                      fullWidth
+                                    />
+                                  </>
+                                )}
+                              </div>
+                            ) : isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
+                              <>
+                                {listVal.map((item, idx) => (
+                                  <div key={idx} style={{ display: "flex", alignItems: "center", marginBottom: "0.5rem" }}>
+                                    <TextField
+                                      value={item}
+                                      onChange={val => handleListValueChange(pid, idx, val)}
+                                      multiline
+                                      autoComplete="off"
+                                      fullWidth
+                                      label={idx === 0 ? "Metafield Value (List Item)" : undefined}
+                                      labelHidden={idx !== 0}
+                                    />
+                                    {listVal.length > 1 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRemoveListItem(pid, idx)}
+                                        style={{
+                                          backgroundColor: "#f37b7bff",
+                                          color: "white",
+                                          border: "none",
+                                          width: "28px",
+                                          height: "22px",
+                                          borderRadius: "4px",
+                                          cursor: "pointer",
+                                          marginLeft: "8px",
+                                        }}
+                                      >−</button>
+                                    )}
+                                  </div>
+                                ))}
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddListItem(pid)}
+                                  style={{
+                                    backgroundColor: "#7fabf0ff",
+                                    color: "white",
+                                    border: "none",
+                                    padding: "3px 9px",
+                                    borderRadius: "4px",
+                                    cursor: "pointer",
+                                    marginTop: "0.5rem",
+                                  }}
+                                >＋ Add List Item</button>
+                              </>
+                            ) : isFileType ? (
+                              <>
+                                <Text as="p" variant="bodyMd">Upload File (or enter a URL)</Text>
+                                <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+                                  <Button
+                                    onClick={() => {
+                                      setUploadProductId(pid);
+                                      fileInputRef.current?.click();
+                                    }}
+                                    disabled={uploading}
+                                  >Upload File</Button>
+                                  <input
+                                    type="file"
+                                    style={{ display: "none" }}
+                                    ref={fileInputRef}
+                                    onChange={e => handleFileChange(e, pid)}
+                                  />
+                                  {uploading && uploadProductId === pid && (
+                                    <Text as="span" variant="bodySm" color="subdued">Uploading...</Text>
+                                  )}
+                                </div>
+                                <TextField
+                                  label="Metafield Value (URL)"
+                                  value={value}
+                                  onChange={val => handleValueChange(pid, val)}
+                                  autoComplete="off"
+                                  fullWidth
+                                  placeholder="Paste a URL or upload a file"
+                                />
+                              </>
+                            ) : selectedType === "boolean" ? (
+                              <Select
+                                label="Metafield Value"
+                                options={[
+                                  { label: "Select...", value: "" },
+                                  { label: "True", value: "true" },
+                                  { label: "False", value: "false" }
+                                ]}
+                                value={value}
+                                onChange={val => handleValueChange(pid, val)}
+                              />
+                            ) : (
+                              <TextField
+                                label="Metafield Value"
+                                value={value}
+                                onChange={val => handleValueChange(pid, val)}
+                                multiline={selectedType === "rich_text_field" || selectedType === "json"}
+                                autoComplete="off"
+                                fullWidth
+                                type={selectedType === "integer" || selectedType === "float" ? "number" : "text"}
+                              />
+                            )}
+                          </td>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            <Button
+                              onClick={e => { e.preventDefault(); handleRowUpdate(pid); }}
+                              size="slim"
+                              disabled={uploading}
+                            >Update</Button>
+                            <Button
+                              destructive
+                              size="slim"
+                              onClick={e => { e.preventDefault(); handleRowClear(pid); }}
+                              disabled={uploading}
+                              style={{ marginLeft: "6px" }}
+                            >
+                              Clear Values
+                            </Button>
+                          </td>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            {successMap[pid] && <Text variant="bodyMd" color="success">✅</Text>}
+                            {errorMap[pid] && <Text variant="bodyMd" color="critical">{errorMap[pid]}</Text>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Save/Update Button */}
+            <Button
+              submit
+              primary
+              loading={fetcher.state === "submitting" || fetcher.state === "loading"}
+              disabled={
+                !selectedProductIds.length ||
+                !selectedDef ||
+                uploading ||
+                fetcher.state === "submitting" ||
+                fetcher.state === "loading"
+              }
+              style={{
+                backgroundColor: "#16a34a",
+                color: "white",
+                padding: "10px 20px",
+                borderRadius: "6px",
+              }}
+            >
+              Save All Metafields
+            </Button>
+          </form>
+        </Card>
+      </Layout.Section>
+    </Layout>
+
+    {/* NEW: Metafield Definition Creation Modal */}
+    <CreateMetafieldDefinitionModal
+      isOpen={showCreateModal}
+      onClose={() => setShowCreateModal(false)}
+      onSubmit={(definitionData) => {
+        const formData = new FormData();
+        formData.append("intent", "createMetafieldDefinition");
+        formData.append("namespace", definitionData.namespace);
+        formData.append("key", definitionData.key);
+        formData.append("name", definitionData.name);
+        formData.append("type", reverseTypeMap[definitionData.type] || definitionData.type);
+        formData.append("description", definitionData.description);
+        definitionFetcher.submit(formData, { method: "post", action: "." });
+      }}
+      isSubmitting={definitionFetcher.state === "submitting" || definitionFetcher.state === "loading"}
+      errors={definitionFetcher.data?.errors}
+    />
+  </Page>
+);
 }
