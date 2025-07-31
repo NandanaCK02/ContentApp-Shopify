@@ -956,65 +956,70 @@ const isFileType = selectedType === "file_reference";
   };
 
  const handleBulkSet = () => {
-  // 1. Handle multiline text field with HTML table input mode first
-  
+  // =========================
+  // 1. Multi-line Text Field: HTML TABLE MODE
+  // =========================
   if (selectedType === "multi_line_text_field" && bulkMultiTextMode === "html") {
     const newTableDataByProduct = { ...tableDataByProduct };
     const newMultiTextModeByProduct = { ...multiTextModeByProduct };
-
     selectedProductIds.forEach(pid => {
       newTableDataByProduct[pid] = bulkTableData;
       newMultiTextModeByProduct[pid] = "html";
     });
-
     setTableDataByProduct(newTableDataByProduct);
     setMultiTextModeByProduct(newMultiTextModeByProduct);
-
-    console.log("Bulk set HTML table data and mode for products:", newTableDataByProduct, newMultiTextModeByProduct);
-    return; // exit early, done with bulk setting
+    console.log("Bulk set HTML table data and mode:", newTableDataByProduct, newMultiTextModeByProduct);
+    return;
   }
 
-  // 2. Handle list or JSON types
+  // =========================
+  // 2. Multi-line Text Field: PLAIN TEXT MODE (this was missing/needed)
+  // =========================
+  if (selectedType === "multi_line_text_field" && bulkMultiTextMode === "plain") {
+    const newVals = { ...metafieldValues };
+    const newMultiTextModeByProduct = { ...multiTextModeByProduct };
+    selectedProductIds.forEach(pid => {
+      newVals[pid] = bulkValue;
+      newMultiTextModeByProduct[pid] = "plain";
+    });
+    setMetafieldValues(newVals);
+    setMultiTextModeByProduct(newMultiTextModeByProduct);
+    console.log("Bulk set plain text and mode:", newVals, newMultiTextModeByProduct);
+    return;
+  }
+
+  // =========================
+  // 3. LIST/JSON TYPES
+  // =========================
   const bulkItems = bulkListValue.filter(v => v && v.trim() !== "");
-  
   if (isListType || (isJsonType && Array.isArray(bulkItems))) {
     console.log("Inside list/json type block");
-
     const updatedListValues = {};
-
     selectedProductIds.forEach(pid => {
-      // Filter existing list values to valid, non-empty strings before processing
-      const existing = (listValues[pid] || []).filter(
-        item => typeof item === "string" && item.trim() !== ""
-      );
-
+      // Ensure existing items are valid strings before processing
+      const existing = (listValues[pid] || []).filter(item => typeof item === 'string' && item.trim() !== '');
       console.log(`Processing PID: ${pid}, Existing (filtered):`, existing);
-
       if (existing.length > 0) {
-        // Append bulk items to existing list for this product
-        console.log("Appending to existing list");
         updatedListValues[pid] = [...existing, ...bulkItems];
       } else {
-        // No valid existing list items; assign bulk items directly
-        console.log("Assigning bulk items directly (no existing valid values)");
         updatedListValues[pid] = [...bulkItems];
       }
     });
-
     console.log("updatedListValues before setListValues:", updatedListValues);
     setListValues(updatedListValues);
-  } else {
-    // 3. For scalar or plain multiline text types: assign bulkValue per product
-    console.log("Inside non-list/json type block");
-
-    const newVals = {};
-    selectedProductIds.forEach(pid => {
-      newVals[pid] = bulkValue;
-    });
-
-    console.log("newVals before setMetafieldValues:", newVals);
-    setMetafieldValues(newVals);
+    return;
   }
+
+  // =========================
+  // 4. SCALAR (DEFAULT) TYPES
+  // =========================
+  console.log("Inside non-list/json type block");
+  const newVals = {};
+  selectedProductIds.forEach(pid => {
+    newVals[pid] = bulkValue;
+  });
+  console.log("newVals before setMetafieldValues:", newVals);
+  setMetafieldValues(newVals);
 };
 
   // FILE UPLOAD
