@@ -45,6 +45,35 @@ function isValidUrl(str) {
   }
 }
 
+// Helper function for exponential backoff with GraphQL calls
+async function callShopifyGraphQL(admin, query, variables, retries = 5, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await admin.graphql(query, { variables });
+      const data = await response.json();
+
+      // Check for GraphQL errors or specific API errors that indicate retry needed
+      if (data.errors && data.errors.some(e => e.extensions?.code === 'THROTTLED' || e.message.includes('rate limit'))) {
+        console.warn(`  WARNING: Rate limit hit. Retrying in ${delay / 1000}s... (Attempt ${i + 1}/${retries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2; // Exponential backoff
+        continue; // Retry
+      }
+      return data; // Return successful response or non-rate-limit error
+    } catch (error) {
+      console.error(`  ERROR: Network error during GraphQL call (Attempt ${i + 1}/${retries}):`, error);
+      if (i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2;
+      } else {
+        throw error; // Re-throw after max retries
+      }
+    }
+  }
+  throw new Error("Max retries exceeded for GraphQL call.");
+}
+
+
 // --- GraphQL Queries and Mutations ---
 
 const GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY = `
@@ -181,10 +210,7 @@ export const loader = async ({ request }) => {
   try {
     // First pass: Fetch all collections and collect all GIDs from reference metafields
     while (hasNextPage) {
-      const response = await admin.graphql(GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY, {
-        variables: { cursor },
-      });
-      const data = await response.json();
+      const data = await callShopifyGraphQL(admin, GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY, { cursor });
 
       if (data.errors) {
         console.error("GraphQL loader errors (GET_ALL_COLLECTIONS_WITH_METAFIELDS):", JSON.stringify(data.errors, null, 2));
@@ -235,15 +261,7 @@ export const loader = async ({ request }) => {
       if (batch.length === 0) continue; // Skip empty batches
 
       try {
-        // Add a small delay between batches to mitigate rate limits if needed
-        if (i > 0) {
-            await new Promise(resolve => setTimeout(resolve, 50)); // Delay for 50ms between batches
-        }
-
-        const response = await admin.graphql(GET_COLLECTION_TITLES_QUERY, {
-          variables: { ids: batch },
-        });
-        const result = await response.json();
+        const result = await callShopifyGraphQL(admin, GET_COLLECTION_TITLES_QUERY, { ids: batch });
 
         if (result.errors) {
           console.error("GraphQL loader (GET_COLLECTION_TITLES) errors for batch GIDs:", JSON.stringify(result.errors, null, 2));
@@ -437,6 +455,7 @@ function convertValueForShopifyType(value, type) {
 export const action = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   if (!session) {
+    console.error("Action Error: Authentication required.");
     return json({ success: false, error: "Authentication required.", status: 401 }, { status: 401 });
   }
 
@@ -445,23 +464,30 @@ export const action = async ({ request }) => {
   try {
     formData = await unstable_parseMultipartFormData(request, uploadHandler);
   } catch (error) {
-    console.error("Error parsing multipart form data:", error);
+    console.error("Action Error: Error parsing multipart form data:", error);
     return json({ success: false, error: "Failed to parse file upload. File might be too large or corrupted.", details: error.message }, { status: 400 });
   }
 
   const file = formData.get("file");
 
   if (!file || !(file instanceof Blob)) {
+    console.error("Action Error: No file uploaded or invalid file type.");
     return json({ success: false, error: "No file uploaded or invalid file type. Please upload an Excel (.xlsx) file.", status: 400 }, { status: 400 });
   }
 
   let workbook;
   let worksheet;
   let headerRowValues;
-  const collectionsData = JSON.parse(formData.get("collectionsData"));
+  let collectionsData;
+  try {
+    collectionsData = JSON.parse(formData.get("collectionsData"));
+  } catch (e) {
+    console.error("Action Error: Failed to parse collectionsData from form data:", e);
+    return json({ success: false, error: "Internal error: Failed to parse initial collection data.", status: 500 });
+  }
   // This map now holds { key: { type, namespace } } for known metafields
   const originalMetafieldDefinitionsMap = collectionsData.metafieldDefinitions || {};
-  console.log("Loader-provided Metafield Definitions:", JSON.stringify(originalMetafieldDefinitionsMap, null, 2));
+  console.log("Action Start: Loader-provided Metafield Definitions:", JSON.stringify(originalMetafieldDefinitionsMap, null, 2));
 
 
   try {
@@ -472,6 +498,7 @@ export const action = async ({ request }) => {
     worksheet = workbook.worksheets[0];
 
     if (!worksheet) {
+      console.error("Action Error: Excel file is empty or invalid format. No worksheet found.");
       return json({ success: false, error: "Excel file is empty or invalid format. No worksheet found.", status: 400 });
     }
 
@@ -482,11 +509,12 @@ export const action = async ({ request }) => {
 
     // Expected minimal headers
     if (!filteredHeaderRowValues || filteredHeaderRowValues.length < 7) {
+      console.error("Action Error: Excel file is missing expected header columns.");
       return json({ success: false, error: "Excel file is missing expected header columns (Collection ID, Title, Description, Sort Order, Template Suffix, Collection Type, Smart Collection: Applied Disjunctively).", status: 400 });
     }
 
   } catch (error) {
-    console.error("Error reading Excel file:", error);
+    console.error("Action Error: Error reading Excel file:", error);
     return json({ success: false, error: `Failed to read Excel file: ${error.message}. Ensure it's a valid .xlsx format.`, status: 400 }, { status: 400 });
   }
 
@@ -571,14 +599,11 @@ export const action = async ({ request }) => {
     for (let i = 0; i < uniqueHandlesArray.length; i += BATCH_QUERY_SIZE) {
       const batchHandles = uniqueHandlesArray.slice(i, i + BATCH_QUERY_SIZE);
       try {
-        if (i > 0) {
-          await new Promise(resolve => setTimeout(resolve, 50)); // Delay between batches
-        }
-
         const queryStrings = batchHandles.map(handle => `handle:${JSON.stringify(handle)}`);
         const query = queryStrings.join(" OR ");
+        console.log(`  DEBUG: Resolving handles batch (startIndex: ${i}). Query: ${query}`);
 
-        const response = await admin.graphql(`
+        const response = await callShopifyGraphQL(admin, `
           query getCollectionGidsByHandles($query: String!) {
             collections(first: 250, query: $query) {
               nodes {
@@ -588,12 +613,12 @@ export const action = async ({ request }) => {
             }
           }
         `, {
-          variables: { query },
+          query,
         });
 
-        const result = await response.json();
+        const result = response; // Already parsed by callShopifyGraphQL
         if (result.errors) {
-          console.error(`GraphQL errors resolving handles batch (starting at index ${i}):`, JSON.stringify(result.errors, null, 2));
+          console.error(`  ERROR: GraphQL errors resolving handles batch (starting at index ${i}):`, JSON.stringify(result.errors, null, 2));
           // Continue, specific handles will not be resolved
         } else {
           for (const node of result.data.collections.nodes) {
@@ -601,11 +626,54 @@ export const action = async ({ request }) => {
               handleToGidMap.set(node.handle, node.id);
             }
           }
+          console.log(`  DEBUG: Resolved handles batch. Found ${result.data.collections.nodes.length} GIDs.`);
         }
       } catch (error) {
-        console.error(`Error resolving handles batch (starting at index ${i}):`, error);
+        console.error(`  ERROR: Error resolving handles batch (starting at index ${i}):`, error);
       }
     }
+  }
+
+  // Before the main loop, fetch all existing collections by handle for upsert logic
+  const existingCollectionsMap = new Map(); // handle -> GID
+  let existingCollectionsCursor = null;
+  let hasMoreExistingCollections = true;
+
+  try {
+      while (hasMoreExistingCollections) {
+          const response = await callShopifyGraphQL(admin, `
+              query getAllCollectionHandles($cursor: String) {
+                  collections(first: 250, after: $cursor) {
+                      pageInfo {
+                          hasNextPage
+                          endCursor
+                      }
+                      nodes {
+                          id
+                          handle
+                      }
+                  }
+              }
+          `, { cursor: existingCollectionsCursor });
+
+          if (response.errors) {
+              console.error("GraphQL loader errors (getAllCollectionHandles):", JSON.stringify(response.errors, null, 2));
+              throw new Error(`Failed to fetch existing collection handles: ${response.errors.map(e => e.message).join(", ")}`);
+          }
+
+          const result = response.data.collections;
+          result.nodes.forEach(col => {
+              if (col.handle) {
+                  existingCollectionsMap.set(col.handle, col.id);
+              }
+          });
+          hasMoreExistingCollections = result.pageInfo.hasNextPage;
+          existingCollectionsCursor = result.pageInfo.endCursor;
+      }
+      console.log(`  DEBUG: Fetched ${existingCollectionsMap.size} existing collection handles for upsert logic.`);
+  } catch (error) {
+      console.error("Error fetching existing collection handles:", error);
+      return json({ success: false, error: error.message || "Failed to load existing collections for upsert.", status: 500 });
   }
 
 
@@ -620,27 +688,49 @@ export const action = async ({ request }) => {
     const appliedDisjunctivelyRaw = getCellVal(row, "Smart Collection: Applied Disjunctively");
 
     console.log(`\n--- Processing Row ${rowIndex} ---`);
-    console.log(`Collection ID from Excel: "${id}", Title from Excel: "${title}"`);
+    console.log(`  Row ${rowIndex}: Collection ID from Excel: "${id}", Title from Excel: "${title}"`);
 
     // Determine if it's an update or create operation
-    const isUpdate = id && id.startsWith("gid://shopify/Collection/");
-    let mutationType = isUpdate ? "update" : "create";
-    console.log(`Determined operation type: "${mutationType}".`);
+    let targetCollectionId = id; // This will hold the GID of the collection to update metafields on
+    let mutationType = "create"; // Default to create
 
-    // Validate Collection ID for update operations
-    if (!isUpdate && !title) {
-        errors.push({ row: rowIndex, message: "Skipping row: Collection ID is missing or invalid, and Title is empty. Cannot create or update collection." });
-        console.error(`Row ${rowIndex}: Skipping. Collection ID is invalid for update and title is empty for new creation.`);
-        continue;
+    if (id && id.startsWith("gid://shopify/Collection/")) {
+        // If an ID is provided and it's a valid GID, it's an update
+        mutationType = "update";
+        targetCollectionId = id;
+        console.log(`  Row ${rowIndex}: Collection ID provided, determined operation type: "${mutationType}".`);
+    } else {
+        // If no valid GID is provided, try to find an existing collection by matching its handle
+        // Derive handle from title (Shopify's default behavior for new collections)
+        const derivedHandle = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-*|-*$/g, '');
+        const existingGidByHandle = existingCollectionsMap.get(derivedHandle);
+        if (existingGidByHandle) {
+            mutationType = "update";
+            targetCollectionId = existingGidByHandle;
+            console.log(`  Row ${rowIndex}: No Collection ID provided, but found existing collection by derived handle "${derivedHandle}" (GID: ${targetCollectionId}). Determined operation type: "${mutationType}".`);
+        } else {
+            mutationType = "create";
+            targetCollectionId = null; // Will be populated after creation
+            console.log(`  Row ${rowIndex}: No Collection ID provided and no existing collection found by derived handle. Determined operation type: "${mutationType}".`);
+        }
     }
-    if (isUpdate && !id.startsWith("gid://shopify/Collection/")) {
-      errors.push({
-        row: rowIndex,
-        message: `Invalid Collection ID in Column 'Collection ID'. Expected format: 'gid://shopify/Collection/12345'. Found: "${id || 'EMPTY'}". Skipping update for this row.`
-      });
-      console.error(`Row ${rowIndex}: Invalid Collection ID found for update: "${id}"`);
+
+    // Validate Collection ID for update operations (after upsert logic)
+    if (mutationType === "update" && (!targetCollectionId || !targetCollectionId.startsWith("gid://shopify/Collection/"))) {
+      const msg = `Invalid Collection ID for update in Column 'Collection ID' or resolution by handle failed. Expected format: 'gid://shopify/Collection/12345'. Found: "${id || 'EMPTY'}". Skipping update for this row.`;
+      errors.push({ row: rowIndex, message: msg });
+      console.error(`  Row ${rowIndex}: ${msg}`);
       continue;
     }
+
+    // Validate if title is present for new collections
+    if (mutationType === "create" && !title) {
+        const msg = "Skipping row: Title is empty for a new collection. Cannot create collection without a title.";
+        errors.push({ row: rowIndex, message: msg });
+        console.error(`  Row ${rowIndex}: ${msg}`);
+        continue;
+    }
+
 
     const collectionInput = {
       title,
@@ -653,8 +743,9 @@ export const action = async ({ request }) => {
       if (validSortOrders.includes(sortOrder)) {
         collectionInput.sortOrder = sortOrder;
       } else {
-        errors.push({ row: rowIndex, message: `Invalid Sort Order value: "${sortOrderRaw}". Must be one of: ${validSortOrders.join(", ")}. Skipping sortOrder update.` });
-        console.warn(`Row ${rowIndex}: Invalid Sort Order: "${sortOrderRaw}"`);
+        const msg = `Invalid Sort Order value: "${sortOrderRaw}". Must be one of: ${validSortOrders.join(", ")}. Skipping sortOrder update.`;
+        errors.push({ row: rowIndex, message: msg });
+        console.warn(`  Row ${rowIndex}: ${msg}`);
       }
     }
 
@@ -663,20 +754,37 @@ export const action = async ({ request }) => {
     // --- Smart Collection RuleSet Handling ---
     if (collectionType === 'smart') {
       const rules = [];
+      const validRuleColumns = ['TAG', 'TITLE', 'TYPE', 'VENDOR', 'VARIANT_COMPARE_AT_PRICE', 'VARIANT_PRICE', 'VARIANT_WEIGHT'];
+      const validRuleRelations = ['CONTAINS', 'ENDS_WITH', 'EQUALS', 'GREATER_THAN', 'IS_NOT_SET', 'IS_SET', 'LESS_THAN', 'NOT_CONTAINS', 'NOT_EQUALS', 'STARTS_WITH'];
+
       let ruleIndex = 1;
       while (headerMap.has(`Rule ${ruleIndex} - Column`)) {
         const column = String(getCellVal(row, `Rule ${ruleIndex} - Column`) || '').trim();
         const relation = String(getCellVal(row, `Rule ${ruleIndex} - Relation`) || '').trim();
         const condition = getCellVal(row, `Rule ${ruleIndex} - Condition`);
 
+        // Validate column and relation against Shopify's allowed enums
+        const isColumnValid = validRuleColumns.includes(column);
+        const isRelationValid = validRuleRelations.includes(relation);
+
         if (column && relation && condition !== undefined && String(condition).trim() !== '') {
-          rules.push({ column, relation, condition: String(condition) });
+          if (isColumnValid && isRelationValid) {
+            rules.push({ column, relation, condition: String(condition) });
+          } else {
+            let validationMessage = `Invalid rule ${ruleIndex}: `;
+            if (!isColumnValid) {
+              validationMessage += `Column "${column}" is not valid. Must be one of: ${validRuleColumns.join(", ")}. `;
+            }
+            if (!isRelationValid) {
+              validationMessage += `Relation "${relation}" is not valid. Must be one of: ${validRuleRelations.join(", ")}. `;
+            }
+            errors.push({ row: rowIndex, message: validationMessage.trim() });
+            console.warn(`  Row ${rowIndex}: ${validationMessage.trim()}`);
+          }
         } else if (column || relation || (condition !== undefined && String(condition).trim() !== '')) {
-          errors.push({
-            row: rowIndex,
-            message: `Incomplete rule ${ruleIndex} for smart collection. All of 'Column', 'Relation', 'Condition' must be present and non-empty for rule ${ruleIndex}.`
-          });
-          console.warn(`Row ${rowIndex}: Incomplete rule ${ruleIndex}.`);
+          const msg = `Incomplete rule ${ruleIndex} for smart collection. All of 'Column', 'Relation', 'Condition' must be present and non-empty for rule ${ruleIndex}.`;
+          errors.push({ row: rowIndex, message: msg });
+          console.warn(`  Row ${rowIndex}: ${msg}`);
         }
         ruleIndex++;
       }
@@ -687,95 +795,87 @@ export const action = async ({ request }) => {
           appliedDisjunctively: appliedDisjunctivelyBoolean,
           rules: rules,
         };
-        console.log(`Row ${rowIndex}: Smart collection rules processed: ${rules.length} rules, Applied Disjunctively: ${appliedDisjunctivelyBoolean}.`);
+        console.log(`  Row ${rowIndex}: Smart collection rules processed: ${rules.length} rules, Applied Disjunctively: ${appliedDisjunctivelyBoolean}.`);
       } else {
-        errors.push({
-          row: rowIndex,
-          message: `Collection type is 'Smart' but no valid rules were found. Smart collections require at least one rule. This collection will be treated as Manual.`
-        });
+        const msg = `Collection type is 'Smart' but no valid rules were found. Smart collections require at least one rule. This collection will be treated as Manual.`;
+        errors.push({ row: rowIndex, message: msg });
         collectionInput.ruleSet = null; // Ensure ruleSet is null for Manual
-        console.warn(`Row ${rowIndex}: Smart collection declared but no valid rules found. Setting as Manual.`);
+        console.warn(`  Row ${rowIndex}: ${msg}`);
       }
     } else {
       collectionInput.ruleSet = null; // Explicitly set ruleSet to null for Manual collections
-      console.log(`Row ${rowIndex}: Collection type is 'Manual'. RuleSet set to null.`);
+      console.log(`  Row ${rowIndex}: Collection type is 'Manual'. RuleSet set to null.`);
     }
 
     // --- Perform Collection Update or Create ---
-    let targetCollectionId = id; // This will hold the GID of the collection to update metafields on
-
     try {
-      let mutationResponse;
       let mutationResult;
 
-      if (isUpdate) {
-        const updateInput = { ...collectionInput, id: id };
-        console.log(`Row ${rowIndex}: Attempting to UPDATE existing collection with ID: ${id}. Input:`, JSON.stringify(updateInput, null, 2));
-        mutationResponse = await admin.graphql(COLLECTION_UPDATE_MUTATION, {
-          variables: { input: updateInput },
+      if (mutationType === "update") {
+        const updateInput = { ...collectionInput, id: targetCollectionId };
+        console.log(`  Row ${rowIndex}: Attempting to UPDATE existing collection with ID: ${targetCollectionId}. Input:`, JSON.stringify(updateInput, null, 2));
+        mutationResult = await callShopifyGraphQL(admin, COLLECTION_UPDATE_MUTATION, {
+          input: updateInput,
         });
-        mutationResult = await mutationResponse.json();
 
         if (mutationResult.data?.collectionUpdate?.userErrors?.length > 0) {
           const userErrors = mutationResult.data.collectionUpdate.userErrors.map(e => `${e.field}: ${e.message}`).join("; ");
-          errors.push({
-            row: rowIndex,
-            message: `Collection update errors: ${userErrors}`,
-          });
-          console.error(`Row ${rowIndex}: Collection update user errors: ${userErrors}`);
+          const msg = `Collection update errors: ${userErrors}`;
+          errors.push({ row: rowIndex, message: msg });
+          console.error(`  Row ${rowIndex}: ${msg}`);
           targetCollectionId = null; // Mark as failed to prevent metafield update
         } else if (mutationResult.errors) {
           const graphQLErrors = JSON.stringify(mutationResult.errors.map(e => e.message).join(", "));
-          errors.push({
-            row: rowIndex,
-            message: `Collection update GraphQL errors: ${graphQLErrors}`,
-          });
-          console.error(`Row ${rowIndex}: Collection update GraphQL errors: ${graphQLErrors}`);
+          const msg = `Collection update GraphQL errors: ${graphQLErrors}`;
+          errors.push({ row: rowIndex, message: msg });
+          console.error(`  Row ${rowIndex}: ${msg}`);
           targetCollectionId = null;
         } else {
           updatedCollectionsCount++;
-          console.log(`Row ${rowIndex}: Successfully updated collection ID: ${id}`);
+          console.log(`  Row ${rowIndex}: Successfully updated collection ID: ${targetCollectionId}`);
           targetCollectionId = mutationResult.data.collectionUpdate.collection.id; // Confirm ID
         }
       } else { // Create
-        console.log(`Row ${rowIndex}: Attempting to CREATE new collection. Input:`, JSON.stringify(collectionInput, null, 2));
-        mutationResponse = await admin.graphql(COLLECTION_CREATE_MUTATION, {
-          variables: { input: collectionInput },
+        console.log(`  Row ${rowIndex}: Attempting to CREATE new collection. Input:`, JSON.stringify(collectionInput, null, 2));
+        mutationResult = await callShopifyGraphQL(admin, COLLECTION_CREATE_MUTATION, {
+          input: collectionInput,
         });
-        mutationResult = await mutationResponse.json();
 
         if (mutationResult.data?.collectionCreate?.userErrors?.length > 0) {
           const userErrors = mutationResult.data.collectionCreate.userErrors.map(e => `${e.field}: ${e.message}`).join("; ");
-          errors.push({
-            row: rowIndex,
-            message: `Collection creation errors: ${userErrors}`,
-          });
-          console.error(`Row ${rowIndex}: Collection creation user errors: ${userErrors}`);
+          const msg = `Collection creation errors: ${userErrors}`;
+          errors.push({ row: rowIndex, message: msg });
+          console.error(`  Row ${rowIndex}: ${msg}`);
           targetCollectionId = null;
         } else if (mutationResult.errors) {
           const graphQLErrors = JSON.stringify(mutationResult.errors.map(e => e.message).join(", "));
-          errors.push({
-            row: rowIndex,
-            message: `Collection creation GraphQL errors: ${graphQLErrors}`,
-          });
-          console.error(`Row ${rowIndex}: Collection creation GraphQL errors: ${graphQLErrors}`);
+          const msg = `Collection creation GraphQL errors: ${graphQLErrors}`;
+          errors.push({ row: rowIndex, message: msg });
+          console.error(`  Row ${rowIndex}: ${msg}`);
           targetCollectionId = null;
         } else {
           createdCollectionsCount++;
           const newCollectionId = mutationResult.data.collectionCreate.collection.id;
           if (newCollectionId) {
             targetCollectionId = newCollectionId; // Crucial: use the newly created ID for metafields
-            console.log(`Row ${rowIndex}: Successfully created new collection, ID: ${newCollectionId}`);
+            // Update existingCollectionsMap with the newly created collection's handle and GID
+            const newCollectionHandle = mutationResult.data.collectionCreate.collection.handle; // Assuming handle is returned on create
+            if (newCollectionHandle) {
+                existingCollectionsMap.set(newCollectionHandle, newCollectionId);
+                console.log(`  Row ${rowIndex}: Added new collection handle "${newCollectionHandle}" to upsert map.`);
+            }
+            console.log(`  Row ${rowIndex}: Successfully created new collection, ID: ${newCollectionId}`);
           } else {
-            errors.push({ row: rowIndex, message: `Collection created but no ID returned.` });
-            console.error(`Row ${rowIndex}: Collection created but no ID returned.`);
+            const msg = `Collection created but no ID returned.`;
+            errors.push({ row: rowIndex, message: msg });
+            console.error(`  Row ${rowIndex}: ${msg}`);
             targetCollectionId = null;
           }
         }
       }
 
     } catch (e) {
-      console.error(`Error ${mutationType} collection "${title}" (row ${rowIndex}):`, e);
+      console.error(`  ERROR: Error ${mutationType} collection "${title}" (row ${rowIndex}):`, e);
       errors.push({ row: rowIndex, message: `Collection ${mutationType} failed for "${title}": ${e.message}` });
       targetCollectionId = null; // Mark as failed
       continue; // Skip metafield update if collection failed to create/update
@@ -784,11 +884,12 @@ export const action = async ({ request }) => {
 
     // --- Metafields Update ---
     if (!targetCollectionId) {
-      errors.push({ row: rowIndex, message: `Skipping metafield updates for "${title}" as collection ID is not available after collection operation.` });
-      console.error(`Row ${rowIndex}: Skipping metafield updates. targetCollectionId is missing.`);
+      const msg = `Skipping metafield updates for "${title}" as collection ID is not available after collection operation.`;
+      errors.push({ row: rowIndex, message: msg });
+      console.error(`  Row ${rowIndex}: ${msg}`);
       continue;
     }
-    console.log(`Row ${rowIndex}: Collection successfully ${mutationType}d, actual ID to use for metafields: ${targetCollectionId}. Preparing metafields.`);
+    console.log(`  Row ${rowIndex}: Collection successfully ${mutationType}d, actual ID to use for metafields: ${targetCollectionId}. Preparing metafields.`);
 
 
     const metafieldsToSet = [];
@@ -811,12 +912,12 @@ export const action = async ({ request }) => {
       const shopifyDefinedType = existingMetafieldDef?.type || "single_line_text_field";
       const metafieldNamespace = existingMetafieldDef?.namespace || "custom";
 
-      console.log(`  Row ${rowIndex}, Metafield: "${key}". Raw Value: "${rawValue}"`);
-      console.log(`  Expected Type (from loader): "${existingMetafieldDef?.type || 'N/A'}", Expected Namespace (from loader): "${existingMetafieldDef?.namespace || 'N/A'}"`);
-      console.log(`  Actual Type used for API: "${shopifyDefinedType}", Actual Namespace used for API: "${metafieldNamespace}"`);
+      console.log(`    Row ${rowIndex}, Metafield: "${key}". Raw Value: "${rawValue}"`);
+      console.log(`    Expected Type (from loader): "${existingMetafieldDef?.type || 'N/A'}", Expected Namespace (from loader): "${existingMetafieldDef?.namespace || 'N/A'}"`);
+      console.log(`    Actual Type used for API: "${shopifyDefinedType}", Actual Namespace used for API: "${metafieldNamespace}"`);
 
       if (!existingMetafieldDef) {
-        console.warn(`  WARNING: Row ${rowIndex}, Metafield "${key}": No existing metafield definition found in loader data for this key. Defaulting to type: "${shopifyDefinedType}", namespace: "${metafieldNamespace}". This might cause issues if a different type/namespace is intended for an existing metafield.`);
+        console.warn(`    WARNING: Row ${rowIndex}, Metafield "${key}": No existing metafield definition found in loader data for this key. Defaulting to type: "${shopifyDefinedType}", namespace: "${metafieldNamespace}". This might cause issues if a different type/namespace is intended for an existing metafield.`);
       }
 
       let valueToConvert = rawValue;
@@ -828,14 +929,15 @@ export const action = async ({ request }) => {
           const resolvedGid = handleToGidMap.get(handle);
           if (resolvedGid) {
             valueToConvert = resolvedGid;
-            console.log(`  Row ${rowIndex}, Metafield "${key}": Resolved handle "${handle}" to GID "${resolvedGid}".`);
+            console.log(`    Row ${rowIndex}, Metafield "${key}": Resolved handle "${handle}" to GID "${resolvedGid}".`);
           } else {
-            errors.push({ row: rowIndex, message: `Metafield '${key}' (type: ${shopifyDefinedType}): Could not resolve collection handle "${handle}" to a GID. Skipping this metafield.` });
-            console.warn(`  Row ${rowIndex}, Metafield "${key}": Could not resolve collection handle "${handle}" to a GID.`);
+            const msg = `Metafield '${key}' (type: ${shopifyDefinedType}): Could not resolve collection handle "${handle}" to a GID. Skipping this metafield.`;
+            errors.push({ row: rowIndex, message: msg });
+            console.warn(`    Row ${rowIndex}, ${msg}`);
             continue; // Skip this metafield if handle not resolved
           }
         } else {
-          console.log(`  Row ${rowIndex}, Metafield "${key}": Value "${handle}" is already a GID.`);
+          console.log(`    Row ${rowIndex}, Metafield "${key}": Value "${handle}" is already a GID.`);
         }
       } else if (shopifyDefinedType === 'list.collection_reference' && typeof rawValue === 'string' && String(rawValue).trim() !== '') {
         let handles = [];
@@ -843,16 +945,16 @@ export const action = async ({ request }) => {
           const parsed = JSON.parse(String(rawValue)); // Try parsing as JSON array first
           if (Array.isArray(parsed)) {
             handles = parsed.map(String).filter(Boolean).map(h => h.trim());
-            console.log(`  Row ${rowIndex}, Metafield "${key}": Parsed value as JSON array: ${JSON.stringify(handles)}`);
+            console.log(`    Row ${rowIndex}, Metafield "${key}": Parsed value as JSON array: ${JSON.stringify(handles)}`);
           } else {
             // If not JSON array, assume comma-separated
             handles = String(rawValue).split(',').map(s => s.trim()).filter(Boolean);
-            console.log(`  Row ${rowIndex}, Metafield "${key}": Parsed value as comma-separated handles: ${JSON.stringify(handles)}`);
+            console.log(`    Row ${rowIndex}, Metafield "${key}": Parsed value as comma-separated handles: ${JSON.stringify(handles)}`);
           }
         } catch (e) {
           // If JSON parsing fails, treat as comma-separated
           handles = String(rawValue).split(',').map(s => s.trim()).filter(Boolean);
-          console.log(`  Row ${rowIndex}, Metafield "${key}": JSON parse failed, treating as comma-separated handles: ${JSON.stringify(handles)}`);
+          console.log(`    Row ${rowIndex}, Metafield "${key}": JSON parse failed, treating as comma-separated handles: ${JSON.stringify(handles)}`);
         }
 
         const resolvedGids = [];
@@ -860,30 +962,31 @@ export const action = async ({ request }) => {
         for (const handle of handles) {
           if (handle.startsWith("gid://shopify/Collection/")) {
             resolvedGids.push(handle);
-            console.log(`  Row ${rowIndex}, Metafield "${key}": List item "${handle}" is already a GID.`);
+            console.log(`    Row ${rowIndex}, Metafield "${key}": List item "${handle}" is already a GID.`);
           } else {
             const resolvedGid = handleToGidMap.get(handle);
             if (resolvedGid) {
               resolvedGids.push(resolvedGid);
-              console.log(`  Row ${rowIndex}, Metafield "${key}": Resolved list handle "${handle}" to GID "${resolvedGid}".`);
+              console.log(`    Row ${rowIndex}, Metafield "${key}": Resolved list handle "${handle}" to GID "${resolvedGid}".`);
             } else {
-              errors.push({ row: rowIndex, message: `Metafield '${key}' (type: ${shopifyDefinedType}): Could not resolve collection handle "${handle}" to a GID. This list item will be skipped.` });
-              console.warn(`  Row ${rowIndex}, Metafield "${key}": Could not resolve list handle "${handle}" to a GID.`);
+              const msg = `Metafield '${key}' (type: ${shopifyDefinedType}): Could not resolve collection handle "${handle}" to a GID. This list item will be skipped.`;
+              errors.push({ row: rowIndex, message: msg });
+              console.warn(`    Row ${rowIndex}, ${msg}`);
               allHandlesResolved = false;
             }
           }
         }
         if (allHandlesResolved) {
           valueToConvert = JSON.stringify(resolvedGids);
-          console.log(`  Row ${rowIndex}, Metafield "${key}": Final value for API (list): "${valueToConvert}"`);
+          console.log(`    Row ${rowIndex}, Metafield "${key}": Final value for API (list): "${valueToConvert}"`);
         } else {
-          console.warn(`  Row ${rowIndex}, Metafield "${key}": Skipping this list metafield as not all handles could be resolved.`);
+          console.warn(`    Row ${rowIndex}, Metafield "${key}": Skipping this list metafield as not all handles could be resolved.`);
           continue; // Skip this metafield if any handle in the list could not be resolved
         }
       }
 
       const valueForApi = convertValueForShopifyType(valueToConvert, shopifyDefinedType);
-      console.log(`  Row ${rowIndex}, Metafield "${key}": Converted value for API: "${valueForApi}" (type: ${typeof valueForApi})`);
+      console.log(`    Row ${rowIndex}, Metafield "${key}": Converted value for API: "${valueForApi}" (type: ${typeof valueForApi})`);
 
       // Add to metafieldsToSet only if valueForApi is not undefined (it means conversion was attempted)
       // `null` for valueForApi is intended to clear a metafield
@@ -900,40 +1003,35 @@ export const action = async ({ request }) => {
 
     if (metafieldsToSet.length > 0) {
       try {
-        console.log(`Attempting to set ${metafieldsToSet.length} metafield(s) for collection ID: ${targetCollectionId} (Row ${rowIndex})`);
-        console.log("Metafields payload:", JSON.stringify(metafieldsToSet, null, 2));
+        console.log(`  DEBUG: Attempting to set ${metafieldsToSet.length} metafield(s) for collection ID: ${targetCollectionId} (Row ${rowIndex})`);
+        console.log("  DEBUG: Metafields payload for API:", JSON.stringify(metafieldsToSet, null, 2));
 
-        const metafieldResponse = await admin.graphql(SET_METAFIELDS_MUTATION, {
-          variables: { metafields: metafieldsToSet },
+        const metafieldResult = await callShopifyGraphQL(admin, SET_METAFIELDS_MUTATION, {
+          metafields: metafieldsToSet,
         });
-        const metafieldResult = await metafieldResponse.json();
 
         if (metafieldResult.errors) {
           const graphQLErrors = JSON.stringify(metafieldResult.errors.map(e => e.message).join(", "));
-          console.error(`Metafield update GraphQL errors for row ${rowIndex}:`, graphQLErrors);
-          errors.push({
-            row: rowIndex,
-            message: `Metafield update GraphQL errors: ${graphQLErrors}`
-          });
+          const msg = `Metafield update GraphQL errors: ${graphQLErrors}`;
+          console.error(`  ERROR: Metafield update GraphQL errors for row ${rowIndex}: ${graphQLErrors}`);
+          errors.push({ row: rowIndex, message: msg });
         } else if (metafieldResult.data?.metafieldsSet?.userErrors?.length) {
           const userErrors = metafieldResult.data.metafieldsSet.userErrors.map(e => `${e.field}: ${e.message}`).join("; ");
-          console.error(`Metafield update user errors for row ${rowIndex}:`, userErrors);
-          errors.push({
-            row: rowIndex,
-            message: `Metafield update user errors: ${userErrors}`,
-          });
+          const msg = `Metafield update user errors: ${userErrors}`;
+          console.error(`  ERROR: Metafield update user errors for row ${rowIndex}: ${userErrors}`);
+          errors.push({ row: rowIndex, message: msg });
         } else if (metafieldResult.data?.metafieldsSet?.metafields?.length) {
           updatedMetafieldsCount += metafieldResult.data.metafieldsSet.metafields.length;
-          console.log(`Successfully updated ${metafieldResult.data.metafieldsSet.metafields.length} metafields for collection ${targetCollectionId} (Row ${rowIndex}).`);
+          console.log(`  Successfully updated ${metafieldResult.data.metafieldsSet.metafields.length} metafields for collection ${targetCollectionId} (Row ${rowIndex}).`);
         } else {
-            console.log(`No metafields explicitly returned as updated for collection ${targetCollectionId} (Row ${rowIndex}). This might mean no changes or an empty result.`);
+            console.log(`  No metafields explicitly returned as updated for collection ${targetCollectionId} (Row ${rowIndex}). This might mean no changes or an empty result.`);
         }
       } catch (e) {
-        console.error(`Network or unexpected error updating metafields for collection ${targetCollectionId} (row ${rowIndex}):`, e);
+        console.error(`  Network or unexpected error updating metafields for collection ${targetCollectionId} (row ${rowIndex}):`, e);
         errors.push({ row: rowIndex, message: `Metafield update failed for ID ${targetCollectionId}: ${e.message}` });
       }
     } else {
-        console.log(`No metafields to set for collection ${targetCollectionId} (Row ${rowIndex}).`);
+        console.log(`  No metafields to set for collection ${targetCollectionId} (Row ${rowIndex}).`);
     }
     processedRowsCount++;
   }
