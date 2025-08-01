@@ -9,8 +9,8 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "mysql"
+  url      = "mysql://root:rootmysql@localhost:3306/shopify_app"
 }
 
 model Session {
@@ -36,4 +36,11 @@ model Faq {
   answer       String
   resourceId   String   // stores Shopify resource ID (collection/page)
   resourceType String   // "collections" or "pages"
+}
+
+model Test {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String
+  createdAt DateTime @default(now())
 }

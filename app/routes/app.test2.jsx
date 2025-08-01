@@ -845,6 +845,10 @@ const selectedOriginalType = selectedDefObj?.originalType || "";
 const isListType = selectedType.startsWith("list.");
 const isJsonType = selectedType === "json";
 const isFileType = selectedType === "file_reference";
+const isUrlType = selectedType === "url";
+const isColorType = selectedType === "color";
+
+
 
 
 
@@ -1409,6 +1413,9 @@ return (
                       />
                     )}
 
+                    
+                    
+
                     {/* HTML Table Bulk Input */}
                     {bulkMultiTextMode === "html" && (
                       <>
@@ -1689,36 +1696,38 @@ return (
                                   }}
                                 >＋ Add List Item</button>
                               </>
-                            ) : isFileType ? (
-                              <>
-                                <Text as="p" variant="bodyMd">Upload File (or enter a URL)</Text>
-                                <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
-                                  <Button
-                                    onClick={() => {
-                                      setUploadProductId(pid);
-                                      fileInputRef.current?.click();
-                                    }}
-                                    disabled={uploading}
-                                  >Upload File</Button>
-                                  <input
-                                    type="file"
-                                    style={{ display: "none" }}
-                                    ref={fileInputRef}
-                                    onChange={e => handleFileChange(e, pid)}
-                                  />
-                                  {uploading && uploadProductId === pid && (
-                                    <Text as="span" variant="bodySm" color="subdued">Uploading...</Text>
-                                  )}
-                                </div>
-                                <TextField
-                                  label="Metafield Value (URL)"
-                                  value={value}
-                                  onChange={val => handleValueChange(pid, val)}
-                                  autoComplete="off"
-                                  fullWidth
-                                  placeholder="Paste a URL or upload a file"
-                                />
-                              </>
+                            ) : (isFileType || isUrlType) ? (
+  <>
+    <Text as="p" variant="bodyMd">Upload File (or enter a URL)</Text>
+    <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+      <Button
+        onClick={() => {
+          setUploadProductId(pid);
+          fileInputRef.current?.click();
+        }}
+        disabled={uploading}
+      >
+        Upload File
+      </Button>
+      <input
+        type="file"
+        style={{ display: "none" }}
+        ref={fileInputRef}
+        onChange={e => handleFileChange(e, pid)}
+      />
+      {uploading && uploadProductId === pid && (
+        <Text as="span" variant="bodySm" color="subdued">Uploading...</Text>
+      )}
+    </div>
+    <TextField
+      label="Metafield Value (URL)"
+      value={value}
+      onChange={val => handleValueChange(pid, val)}
+      autoComplete="off"
+      fullWidth
+      placeholder="Paste a URL or upload a file"
+    />
+  </>
                             ) : selectedType === "boolean" ? (
                               <Select
                                 label="Metafield Value"
