@@ -3,7 +3,7 @@
 client_id = "acf943cbc8ac6bb4a9fc21583d9fd292"
 name = "Content-Builder"
 handle = "content-builder"
-application_url = "https://establishing-courier-kinda-chess.trycloudflare.com"
+application_url = "https://boulder-diane-karaoke-feedback.trycloudflare.com"
 embedded = true
 
 [build]
@@ -26,7 +26,7 @@ api_version = "2025-04"
 scopes = "write_products,read_products, read_content, read_themes, read_inventory, read_product_listings,write_files,"
 
 [auth]
-redirect_urls = ["https://establishing-courier-kinda-chess.trycloudflare.com/auth/callback", "https://establishing-courier-kinda-chess.trycloudflare.com/auth/shopify/callback", "https://establishing-courier-kinda-chess.trycloudflare.com/api/auth/callback"]
+redirect_urls = ["https://boulder-diane-karaoke-feedback.trycloudflare.com/auth/callback", "https://boulder-diane-karaoke-feedback.trycloudflare.com/auth/shopify/callback", "https://boulder-diane-karaoke-feedback.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false

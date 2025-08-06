@@ -73,7 +73,6 @@ async function callShopifyGraphQL(admin, query, variables, retries = 5, delay = 
   throw new Error("Max retries exceeded for GraphQL call.");
 }
 
-
 // --- GraphQL Queries and Mutations ---
 
 const GET_ALL_COLLECTIONS_WITH_METAFIELDS_QUERY = `
@@ -186,6 +185,31 @@ const GET_COLLECTION_TITLES_QUERY = `
       ... on Collection {
         id
         title
+      }
+    }
+  }
+`;
+
+// NEW: Deletion Mutations
+const COLLECTION_DELETE_MUTATION = `
+  mutation collectionDelete($id: ID!) {
+    collectionDelete(input: {id: $id}) {
+      deletedCollectionId
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const METAFIELD_DELETE_MUTATION = `
+  mutation metafieldDelete($input: MetafieldDeleteInput!) {
+    metafieldDelete(input: $input) {
+      deletedId
+      userErrors {
+        field
+        message
       }
     }
   }
@@ -480,12 +504,13 @@ export const action = async ({ request }) => {
   let headerRowValues;
   let collectionsData;
   try {
+    // This is the CRUCIAL data for deletion logic: all existing collections and metafields.
     collectionsData = JSON.parse(formData.get("collectionsData"));
   } catch (e) {
     console.error("Action Error: Failed to parse collectionsData from form data:", e);
     return json({ success: false, error: "Internal error: Failed to parse initial collection data.", status: 500 });
   }
-  // This map now holds { key: { type, namespace } } for known metafields
+  const allCollectionsFromLoader = collectionsData.collections || [];
   const originalMetafieldDefinitionsMap = collectionsData.metafieldDefinitions || {};
   console.log("Action Start: Loader-provided Metafield Definitions:", JSON.stringify(originalMetafieldDefinitionsMap, null, 2));
 
@@ -537,11 +562,27 @@ export const action = async ({ request }) => {
     return colIndex ? row.getCell(colIndex)?.value : undefined;
   };
 
-  const handlesToResolve = new Set(); // To collect all unique handles for GID lookup
+  const handlesToResolve = new Set();
+  // NEW: Store IDs and handles from the import file to determine what to delete later
+  const importedCollectionHandles = new Set();
+  const importedCollectionIds = new Set();
 
   // Pre-process all rows to collect collection handles from metafields
   for (let rowIndex = 2; rowIndex <= worksheet.rowCount; rowIndex++) {
     const row = worksheet.getRow(rowIndex);
+    const id = String(getCellVal(row, "Collection ID") || '').trim();
+    const title = String(getCellVal(row, "Title") || '').trim();
+
+    // NEW: Add collections from the import file to our sets
+    if (id && id.startsWith("gid://shopify/Collection/")) {
+      importedCollectionIds.add(id);
+    }
+    const derivedHandle = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-*|-*$/g, '');
+    if (derivedHandle) {
+      importedCollectionHandles.add(derivedHandle);
+    }
+
+
     for (const [header, colIndex] of headerMap.entries()) {
       if (
         ["Collection ID", "Title", "Description", "Sort Order", "Template Suffix", "Collection Type", "Smart Collection: Applied Disjunctively"].includes(header) ||
@@ -571,7 +612,7 @@ export const action = async ({ request }) => {
               }
             });
           } else {
-            // If it's a comma-separated list of handles
+            // If not valid JSON, assume comma-separated
             String(rawValue).split(',').map(s => s.trim()).filter(Boolean).forEach(handle => {
               if (!handle.startsWith("gid://shopify/Collection/")) {
                 handlesToResolve.add(handle);
@@ -677,6 +718,7 @@ export const action = async ({ request }) => {
   }
 
 
+  // Main import loop
   for (let rowIndex = 2; rowIndex <= worksheet.rowCount; rowIndex++) {
     const row = worksheet.getRow(rowIndex);
     const id = String(getCellVal(row, "Collection ID") || '').trim();
@@ -882,7 +924,7 @@ export const action = async ({ request }) => {
     }
 
 
-    // --- Metafields Update ---
+    // --- Metafields Update AND DELETION Logic ---
     if (!targetCollectionId) {
       const msg = `Skipping metafield updates for "${title}" as collection ID is not available after collection operation.`;
       errors.push({ row: rowIndex, message: msg });
@@ -893,6 +935,8 @@ export const action = async ({ request }) => {
 
 
     const metafieldsToSet = [];
+    const metafieldKeysInExcel = new Set(); // NEW: To track metafields in the current Excel row
+
     for (const [header, colIndex] of headerMap.entries()) {
       // Skip standard columns (Collection ID, Title, etc.)
       if (
@@ -904,6 +948,7 @@ export const action = async ({ request }) => {
 
       const rawValue = row.getCell(colIndex)?.value;
       const key = header;
+      metafieldKeysInExcel.add(key); // NEW: Add this key to the set for deletion comparison
 
       // Determine the metafield's defined type and namespace from loader data
       const existingMetafieldDef = originalMetafieldDefinitionsMap[key];
@@ -1001,6 +1046,26 @@ export const action = async ({ request }) => {
       }
     }
 
+    // NEW METAFIELD DELETION LOGIC
+    const existingCollectionFromLoader = allCollectionsFromLoader.find(c => c.id === targetCollectionId);
+    if (existingCollectionFromLoader) {
+      for (const existingMetafield of existingCollectionFromLoader.metafields.nodes) {
+        // If the existing metafield's key is NOT in the Excel file headers, delete it.
+        if (!metafieldKeysInExcel.has(existingMetafield.key)) {
+          console.log(`  Row ${rowIndex}, Collection ${targetCollectionId}: Deleting metafield '${existingMetafield.namespace}.${existingMetafield.key}' as it was not found in the import file.`);
+          try {
+            await callShopifyGraphQL(admin, METAFIELD_DELETE_MUTATION, {
+              input: { id: existingMetafield.id }
+            });
+            updatedMetafieldsCount++; // Count as a "deleted" update
+          } catch (e) {
+            console.error(`  ERROR: Failed to delete metafield '${existingMetafield.id}':`, e);
+            errors.push({ row: rowIndex, message: `Failed to delete old metafield '${existingMetafield.key}': ${e.message}` });
+          }
+        }
+      }
+    }
+
     if (metafieldsToSet.length > 0) {
       try {
         console.log(`  DEBUG: Attempting to set ${metafieldsToSet.length} metafield(s) for collection ID: ${targetCollectionId} (Row ${rowIndex})`);
@@ -1036,13 +1101,48 @@ export const action = async ({ request }) => {
     processedRowsCount++;
   }
 
+  // NEW DELETION LOGIC FOR COLLECTIONS
+  let deletedCollectionsCount = 0;
+  console.log("\n--- Starting Collection Deletion Phase ---");
+  for (const collectionFromLoader of allCollectionsFromLoader) {
+    const isPresentInExcelById = importedCollectionIds.has(collectionFromLoader.id);
+    const isPresentInExcelByHandle = importedCollectionHandles.has(collectionFromLoader.handle);
+    
+    // A collection is a candidate for deletion if it exists in the loader data
+    // but is NOT present in the list of GIDs or Handles from the Excel file.
+    if (!isPresentInExcelById && !isPresentInExcelByHandle) {
+      console.log(`  Deleting collection '${collectionFromLoader.title}' (ID: ${collectionFromLoader.id}) as it was not found in the import file.`);
+      try {
+        const deleteResult = await callShopifyGraphQL(admin, COLLECTION_DELETE_MUTATION, {
+          id: collectionFromLoader.id
+        });
+        if (deleteResult.data?.collectionDelete?.userErrors?.length) {
+          const userErrors = deleteResult.data.collectionDelete.userErrors.map(e => `${e.field}: ${e.message}`).join("; ");
+          console.error(`  ERROR: Failed to delete collection '${collectionFromLoader.title}': ${userErrors}`);
+          errors.push({ row: 'N/A', message: `Collection deletion failed for '${collectionFromLoader.title}': ${userErrors}` });
+        } else if (deleteResult.errors) {
+          const graphQLErrors = JSON.stringify(deleteResult.errors.map(e => e.message).join(", "));
+          console.error(`  ERROR: Failed to delete collection '${collectionFromLoader.title}': GraphQL errors: ${graphQLErrors}`);
+          errors.push({ row: 'N/A', message: `Collection deletion failed for '${collectionFromLoader.title}': ${graphQLErrors}` });
+        } else {
+          deletedCollectionsCount++;
+          console.log(`  Successfully deleted collection '${collectionFromLoader.title}' (ID: ${deleteResult.data.collectionDelete.deletedCollectionId}).`);
+        }
+      } catch (e) {
+        console.error(`  Network or unexpected error deleting collection '${collectionFromLoader.title}' (ID: ${collectionFromLoader.id}):`, e);
+        errors.push({ row: 'N/A', message: `Unexpected error deleting collection '${collectionFromLoader.title}': ${e.message}` });
+      }
+    }
+  }
+
+
   let summaryMessage = `Import process completed.`;
   let isSuccess = errors.length === 0;
 
   if (isSuccess) {
-    summaryMessage += ` All ${processedRowsCount} rows processed. ${createdCollectionsCount} collections created and ${updatedCollectionsCount} updated. ${updatedMetafieldsCount} metafields set successfully.`;
+    summaryMessage += ` All ${processedRowsCount} rows processed. ${createdCollectionsCount} collections created, ${updatedCollectionsCount} updated, and ${deletedCollectionsCount} deleted. ${updatedMetafieldsCount} metafields set successfully.`;
   } else {
-    summaryMessage += ` ${createdCollectionsCount} collections created, ${updatedCollectionsCount} updated, ${updatedMetafieldsCount} metafields set. However, ${errors.length} row(s) had errors.`;
+    summaryMessage += ` ${createdCollectionsCount} collections created, ${updatedCollectionsCount} updated, and ${deletedCollectionsCount} deleted. ${updatedMetafieldsCount} metafields set. However, ${errors.length} row(s) had errors.`;
   }
 
   return json({
@@ -1053,6 +1153,7 @@ export const action = async ({ request }) => {
     updatedCollectionsCount,
     createdCollectionsCount,
     updatedMetafieldsCount,
+    deletedCollectionsCount,
     importedFileName: file.name,
   }, { status: isSuccess ? 200 : 400 });
 };
@@ -1243,14 +1344,14 @@ export default function Collections() {
       const selectedFile = acceptedFiles[0];
       const formData = new FormData();
       formData.append("file", selectedFile);
-      // Pass the known metafield definitions (including namespaces) from the loader to the action
-      formData.append("collectionsData", JSON.stringify({ metafieldDefinitions }));
+      // Pass the known metafield definitions and ALL existing collections from the loader to the action
+      formData.append("collectionsData", JSON.stringify({ collections, metafieldDefinitions }));
 
       setFileName(selectedFile.name);
       setImportErrors([]); // Clear errors when a new file is dropped
       fetcher.submit(formData, { method: "post", encType: "multipart/form-data" });
     }
-  }, [fetcher, metafieldDefinitions]);
+  }, [fetcher, collections, metafieldDefinitions]);
 
   // This is where `rows` are constructed for the DataTable shown in the UI.
   // This already provides a summary and avoids showing individual rule columns twice.

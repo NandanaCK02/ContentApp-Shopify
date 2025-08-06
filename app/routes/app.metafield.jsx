@@ -59,80 +59,142 @@ const reverseTypeMap = Object.fromEntries(
   Object.entries(typeMap).map(([key, value]) => [value, key])
 );
 
-export async function loader({ request }) {
-  const { admin } = await authenticate.admin(request);
 
-  let products = [];
-  let productCursor = null;
-  let hasNextPage = true;
 
-  while (hasNextPage) {
-    const res = await admin.graphql(`
-      {
-        products(first: 100${productCursor ? `, after: "${productCursor}"` : ""}) {
-          edges {
-            cursor
-            node { id title }
-          }
-          pageInfo { hasNextPage }
-        }
-      }
-    `);
-    const data = await res.json();
-    const edges = data?.data?.products?.edges || [];
-    products.push(...edges.map((e) => e.node));
-    hasNextPage = data?.data?.products?.pageInfo?.hasNextPage;
-    if (hasNextPage) productCursor = edges[edges.length - 1].cursor;
+const MAX_PAGES = 5; // Maximum pages to fetch for products/definitions
+const API_TIMEOUT_MS = 15000; // 15 seconds timeout per Shopify API call
+
+
+// Helper function to fetch Shopify GraphQL with timeout support
+async function fetchWithTimeout(admin, query, variables = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+  try {
+    const response = await admin.graphql(query, {
+      variables,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    return response.json();
+  } catch (error) {
+    clearTimeout(timeoutId);
+    console.error("Shopify API fetch error or timeout:", error);
+    throw error;
   }
-
-  let definitions = [];
-  let defCursor = null;
-  hasNextPage = true;
-
-  while (hasNextPage) {
-    const res = await admin.graphql(`
-      {
-        metafieldDefinitions(first: 100, ownerType: PRODUCT${defCursor ? `, after: "${defCursor}"` : ""}) {
-          edges {
-            cursor
-            node {
-              name
-              namespace
-              key
-              type { name }
-              id
-            }
-          }
-          pageInfo { hasNextPage }
-        }
-      }
-    `);
-    const data = await res.json();
-    const edges = data?.data?.metafieldDefinitions?.edges || [];
-    definitions.push(
-      ...edges.map((e) => {
-        let typeKey = e.node.type.name;
-        if (typeKey.startsWith("LIST.")) typeKey = "LIST." + typeKey.split(".")[1];
-        return {
-          ...e.node,
-          type: typeMap[typeKey] || e.node.type.name, // Display friendly type
-          originalType: e.node.type.name, // Actual Shopify API type
-        };
-      })
-    );
-    hasNextPage = data?.data?.metafieldDefinitions?.pageInfo?.hasNextPage;
-    if (hasNextPage) defCursor = edges[edges.length - 1].cursor;
-  }
-
-  return json({ products, definitions });
 }
+
+export async function loader({ request }) {
+  try {
+    const { admin } = await authenticate.admin(request);
+
+    // ------- Fetch Products with Pagination Limit -------
+    let products = [];
+    let productCursor = null;
+    let hasNextPage = true;
+    let productPageCount = 0;
+
+    while (hasNextPage && productPageCount < MAX_PAGES) {
+      const query = `
+        query getProducts($after: String) {
+          products(first: 100, after: $after) {
+            edges {
+              cursor
+              node { id title }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      `;
+
+      const data = await fetchWithTimeout(admin, query, { after: productCursor });
+
+      const edges = data?.data?.products?.edges || [];
+      products.push(...edges.map((e) => e.node));
+      hasNextPage = data?.data?.products?.pageInfo?.hasNextPage;
+
+      if (hasNextPage && edges.length > 0) {
+        productCursor = edges[edges.length - 1].cursor;
+      }
+
+      productPageCount++;
+    }
+
+    // ------- Fetch Metafield Definitions with Pagination Limit -------
+    let definitions = [];
+    let defCursor = null;
+    hasNextPage = true;
+    let defPageCount = 0;
+
+    while (hasNextPage && defPageCount < MAX_PAGES) {
+      const query = `
+        query getMetafieldDefinitions($after: String) {
+          metafieldDefinitions(first: 100, ownerType: PRODUCT, after: $after) {
+            edges {
+              cursor
+              node {
+                name
+                namespace
+                key
+                type { name }
+                id
+              }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      `;
+
+      const data = await fetchWithTimeout(admin, query, { after: defCursor });
+
+      const edges = data?.data?.metafieldDefinitions?.edges || [];
+      definitions.push(
+        ...edges.map((e) => {
+          let typeKey = e.node.type.name;
+          if (typeKey.startsWith("LIST.")) typeKey = "LIST." + typeKey.split(".")[1];
+          return {
+            ...e.node,
+            type: typeMap[typeKey] || e.node.type.name,
+            originalType: e.node.type.name,
+          };
+        })
+      );
+      hasNextPage = data?.data?.metafieldDefinitions?.pageInfo?.hasNextPage;
+
+      if (hasNextPage && edges.length > 0) {
+        defCursor = edges[edges.length - 1].cursor;
+      }
+
+      defPageCount++;
+    }
+
+    return json({ products, definitions });
+  } catch (error) {
+    console.error("Loader error:", error);
+    // Return a generic error response, or customize as you wish
+    throw new Response("Failed to load data", { status: 500 });
+  }
+}
+
+
 
 const MAX_RETRIES = 5;
 const RETRY_DELAY_MS = 2000;
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const BULK_UPDATE_CHUNK_SIZE = 20;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function chunkArray(array, chunkSize) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += chunkSize) {
+    chunks.push(array.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
 
 export async function action({ request }) {
   const contentType = request.headers.get("content-type");
+
+  // ----------- FILE UPLOAD HANDLER (multipart/form-data) ---------
   if (request.method === "POST" && contentType?.includes("multipart/form-data")) {
     const uploadHandler = unstable_createMemoryUploadHandler({ maxPartSize: 10_000_000 });
     const formData = await unstable_parseMultipartFormData(request, uploadHandler);
@@ -140,21 +202,19 @@ export async function action({ request }) {
     if (!file || typeof file !== "object") {
       return json({ success: false, error: "No file uploaded" }, { status: 400 });
     }
+
     let admin;
-try {
-  const authResult = await authenticate.admin(request);
-
-  if (!authResult || !authResult.admin) {
-    console.error("Authentication failed: No admin session returned.");
-    return new Response("Unauthorized", { status: 401 });
-  }
-
-  admin = authResult.admin;
-} catch (err) {
-  console.error("Authentication error during file upload/action:", err);
-  return new Response("Unauthorized - error in authenticate.admin", { status: 401 });
-}
-
+    try {
+      const authResult = await authenticate.admin(request);
+      if (!authResult || !authResult.admin) {
+        console.error("Authentication failed: No admin session returned.");
+        return new Response("Unauthorized", { status: 401 });
+      }
+      admin = authResult.admin;
+    } catch (err) {
+      console.error("Authentication error during file upload/action:", err);
+      return new Response("Unauthorized - error in authenticate.admin", { status: 401 });
+    }
 
     // 1. Get staged upload target
     const stagedUploadRes = await admin.graphql(`
@@ -220,7 +280,7 @@ try {
       return json({ success: false, error: "An unexpected error occurred during file registration with Shopify." }, { status: 500 });
     }
 
-    // 4. Poll for the file URL with retries
+    // 4. Poll for file URL with retries
     let fileUrl = null;
     for (let i = 0; i < MAX_RETRIES; i++) {
       await delay(RETRY_DELAY_MS);
@@ -233,10 +293,8 @@ try {
           }
         }
       `, { variables: { id: createdFileId } });
-
       const fetchFileData = await fetchFileRes.json();
       const fetchedFile = fetchFileData.data?.node;
-
       if (fetchedFile?.url && /^https?:\/\//.test(fetchedFile.url)) {
         fileUrl = fetchedFile.url;
         break;
@@ -256,96 +314,116 @@ try {
     return json({ success: true, url: fileUrl, intent: "uploadFile" });
   }
 
-  const { admin } = await authenticate.admin(request);
+  // ---------------- AUTHENTICATE ----------------
+  let admin;
+  try {
+    const authResult = await authenticate.admin(request);
+    if (!authResult || !authResult.admin) {
+      console.error("Authentication failed: No admin session returned.");
+      return new Response("Unauthorized", { status: 401 });
+    }
+    admin = authResult.admin;
+  } catch (err) {
+    console.error("Authentication error during action:", err);
+    return new Response("Unauthorized - error in authenticate.admin", { status: 401 });
+  }
+
   const form = await request.formData();
   const intent = form.get("intent");
 
-if (intent === "createMetafieldDefinition") {
-  const namespace = form.get("namespace");
-  const key = form.get("key");
-  const name = form.get("name");
-  const friendlyType = form.get("type"); // Should be exact Shopify metafield type like "single_line_text_field"
-  const description = form.get("description");
+  // --------- CREATE METAFIELD DEFINITION ----------
+  if (intent === "createMetafieldDefinition") {
+    const namespace = form.get("namespace");
+    const key = form.get("key");
+    const name = form.get("name");
+    const friendlyType = form.get("type");
+    const description = form.get("description");
 
-  if (!namespace || !key || !name || !friendlyType) {
-    return json({
-      success: false,
-      errors: [{ message: "Namespace, Key, Name, and Type are required." }],
-      intent,
-    });
-  }
-  const shopifyType = typeMap[friendlyType];
-
-    if (!shopifyType) {
+    if (!namespace || !key || !name || !friendlyType) {
       return json({
         success: false,
-        errors: [
-          { message: `Invalid metafield type: ${friendlyType}` },
-        ],
+        errors: [{ message: "Namespace, Key, Name, and Type are required." }],
+        intent,
       });
     }
 
-  try {
-    const mutation = `
-      mutation CreateMetafieldDefinition($definition: MetafieldDefinitionInput!) {
-        metafieldDefinitionCreate(definition: $definition) {
-          createdDefinition {
-            id
-            key
-            namespace
-            name
-            type { name }
-          }
-          userErrors {
-            field
-            message
-            code
+    const shopifyType = typeMap[friendlyType];
+    if (!shopifyType) {
+      return json({
+        success: false,
+        errors: [{ message: `Invalid metafield type: ${friendlyType}` }],
+      });
+    }
+
+    try {
+      const mutation = `
+        mutation CreateMetafieldDefinition($definition: MetafieldDefinitionInput!) {
+          metafieldDefinitionCreate(definition: $definition) {
+            createdDefinition {
+              id
+              key
+              namespace
+              name
+              type { name }
+            }
+            userErrors {
+              field
+              message
+              code
+            }
           }
         }
+      `;
+      const variables = {
+        definition: {
+          key,
+          namespace,
+          name,
+          ownerType: "PRODUCT",
+          type: shopifyType,
+          description: description || null,
+        },
+      };
+
+      const response = await admin.graphql(mutation, { variables });
+      const result = await response.json();
+
+      const userErrors = result?.data?.metafieldDefinitionCreate?.userErrors || [];
+      const createdDef = result?.data?.metafieldDefinitionCreate?.createdDefinition;
+
+      if (userErrors.length > 0) {
+        return json({ success: false, errors: userErrors, intent });
       }
-    `;
-
-    const variables = {
-      definition: {
-        key,
-        namespace,
-        name,
-        ownerType: "PRODUCT",
-        type: shopifyType,
-        description: description || null,
-      },
-    };
-
-    const response = await admin.graphql(mutation, { variables });
-    const result = await response.json();
-
-    const userErrors = result?.data?.metafieldDefinitionCreate?.userErrors || [];
-    const createdDef = result?.data?.metafieldDefinitionCreate?.definition;
-
-    if (userErrors.length > 0) {
-      return json({ success: false, errors: userErrors, intent });
+      return json({ success: true, definition: createdDef, intent });
+    } catch (err) {
+      console.error("Metafield definition creation error:", err);
+      return json({
+        success: false,
+        errors: [{ message: "Unexpected server error." }],
+        intent,
+      });
     }
-
-    return json({ success: true, definition: createdDef, intent });
-
-  } catch (err) {
-    console.error("Metafield definition creation error:", err);
-    return json({
-      success: false,
-      errors: [{ message: "Unexpected server error." }],
-      intent,
-    });
   }
-}
 
-
-  // BULK UPDATE
+  // --------- BULK UPDATE METAFIELDS WITH CHUNKING ---------
   if (intent === "updateMetafieldsBulk") {
     const definition = form.get("definition");
-    const updates = JSON.parse(form.get("updates") || "[]");
-    if (!definition || !Array.isArray(updates) || updates.length === 0) {
-      return json({ success: false, errors: [{ message: "Definition and at least one update required." }], intent });
+    const updatesRaw = form.get("updates") || "[]";
+
+    if (!definition) {
+      return json({ success: false, errors: [{ message: "Definition required." }], intent });
     }
+
+    let updates;
+    try {
+      updates = JSON.parse(updatesRaw);
+      if (!Array.isArray(updates) || updates.length === 0) {
+        return json({ success: false, errors: [{ message: "At least one update required." }], intent });
+      }
+    } catch {
+      return json({ success: false, errors: [{ message: "Invalid JSON for updates." }], intent });
+    }
+
     const [namespace, key, originalType] = definition.split("___");
 
     const mutation = `
@@ -357,45 +435,64 @@ if (intent === "createMetafieldDefinition") {
       }
     `;
 
-    const results = await Promise.all(updates.map(async ({ productId, value }) => {
-      if (!productId) return { productId, success: false, errors: [{ message: "Missing productId" }] };
-      try {
-        const variables = {
-          metafields: [
-            {
-              ownerId: productId,
-              namespace,
-              key,
-              type: originalType,
-              value,
-            },
-          ],
-        };
-        const response = await admin.graphql(mutation, { variables });
-        const result = await response.json();
-        const userErrors = result?.data?.metafieldsSet?.userErrors || [];
-        if (userErrors.length > 0) {
-          return { productId, success: false, errors: userErrors };
-        }
-        return { productId, success: true };
-      } catch (err) {
-        return { productId, success: false, errors: [{ message: "Server error" }] };
-      }
-    }));
+    const chunks = chunkArray(updates, BULK_UPDATE_CHUNK_SIZE);
+    const results = [];
 
-    const allSuccess = results.every(r => r.success);
+    for (const chunk of chunks) {
+      const metafieldsInput = chunk.map(({ productId, value }) => ({
+        ownerId: productId,
+        namespace,
+        key,
+        type: originalType,
+        value,
+      }));
+
+      try {
+        const response = await admin.graphql(mutation, { variables: { metafields: metafieldsInput } });
+        const data = await response.json();
+
+        const userErrors = data?.data?.metafieldsSet?.userErrors || [];
+        if (userErrors.length > 0) {
+          // Apply same error to all in chunk
+          chunk.forEach(({ productId }) => {
+            results.push({ productId, success: false, errors: userErrors });
+          });
+        } else {
+          chunk.forEach(({ productId }) => {
+            results.push({ productId, success: true });
+          });
+        }
+      } catch (err) {
+        console.error("Error during bulk metafield set:", err);
+        chunk.forEach(({ productId }) => {
+          results.push({
+            productId,
+            success: false,
+            errors: [{ message: "Server error during bulk update." }],
+          });
+        });
+      }
+
+      // Small pause between chunks to avoid rate limits
+      await delay(300);
+    }
+
+    const allSuccess = results.every((r) => r.success);
     return json({ success: allSuccess, results, intent });
   }
 
-  // SINGLE PRODUCT UPDATE (for per-row update)
+  // -------- SINGLE PRODUCT UPDATE --------
   if (intent === "updateMetafield") {
     const productId = form.get("productId");
     const definition = form.get("definition");
     const value = form.get("value");
+
     if (!productId || !definition || value === null) {
       return json({ success: false, errors: [{ message: "Product ID, definition, and value are required." }], intent: "updateMetafield" });
     }
+
     const [namespace, key, originalType] = definition.split("___");
+
     if (originalType === "URL" && !/^https?:\/\//.test(value)) {
       return json({
         success: false,
@@ -403,6 +500,7 @@ if (intent === "createMetafieldDefinition") {
         intent: "updateMetafield",
       });
     }
+
     const mutation = `
       mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
         metafieldsSet(metafields: $metafields) {
@@ -411,6 +509,7 @@ if (intent === "createMetafieldDefinition") {
         }
       }
     `;
+
     const variables = {
       metafields: [
         {
@@ -418,7 +517,7 @@ if (intent === "createMetafieldDefinition") {
           namespace,
           key,
           type: originalType,
-          value: value,
+          value,
         },
       ],
     };
@@ -442,7 +541,7 @@ if (intent === "createMetafieldDefinition") {
     }
   }
 
-  // BULK GET
+  // -------- BULK GET METAFIELD VALUES --------
   if (intent === "getMetafieldValuesBulk") {
     const definition = form.get("definition");
     const productIds = JSON.parse(form.get("productIds") || "[]");
@@ -450,10 +549,11 @@ if (intent === "createMetafieldDefinition") {
       return json({ success: false, errors: [{ message: "Definition and at least one product required." }], intent });
     }
     const [namespace, key, originalType] = definition.split("___");
+
     const results = await Promise.all(productIds.map(async (productId) => {
       try {
         const res = await admin.graphql(`
-          query getMetafield($ownerId: ID!, $namespace:  Single_line_text_field!, $key:  Single_line_text_field!) {
+          query getMetafield($ownerId: ID!, $namespace: String!, $key: String!) {
             node(id: $ownerId) {
               ... on Product {
                 metafield(namespace: $namespace, key: $key) {
@@ -476,12 +576,14 @@ if (intent === "createMetafieldDefinition") {
         return { productId, value: null };
       }
     }));
+
     const values = {};
     for (const { productId, value } of results) values[productId] = value;
+
     return json({ success: true, values, originalType, intent });
   }
 
-  // SINGLE GET (for initial single product mode)
+  // -------- SINGLE GET METAFIELD VALUE --------
   if (intent === "getMetafieldValue") {
     const productId = form.get("productId");
     const definition = form.get("definition");
@@ -494,7 +596,7 @@ if (intent === "createMetafieldDefinition") {
 
     try {
       const res = await admin.graphql(`
-        query getMetafield($ownerId: ID!, $namespace:  Single_line_text_field!, $key:  Single_line_text_field!) {
+        query getMetafield($ownerId: ID!, $namespace: String!, $key: String!) {
           node(id: $ownerId) {
             ... on Product {
               metafield(namespace: $namespace, key: $key) {
@@ -513,7 +615,6 @@ if (intent === "createMetafieldDefinition") {
 
       const data = await res.json();
       const metafieldValue = data?.data?.node?.metafield?.value;
-
       return json({ success: true, value: metafieldValue, originalType, intent: "getMetafieldValue" });
     } catch (err) {
       console.error("Metafield fetch error:", err);
@@ -525,45 +626,48 @@ if (intent === "createMetafieldDefinition") {
     }
   }
 
-  // ─────────────────────────────────────────
-  // CLEAR METAFIELD VALUE (scalar types)
-  // ─────────────────────────────────────────
+  // -------- CLEAR METAFIELD --------
   if (intent === "clearMetafield") {
     const productId = form.get("productId");
-    const definition = form.get("definition"); // "namespace___key"
+    const definition = form.get("definition"); // expected format "namespace___key"
+
     if (!productId || !definition) {
       return json({
         success: false,
         errors: [{ message: "Product ID and definition required." }],
-        intent
+        intent,
       }, { status: 400 });
     }
 
     const [namespace, key] = definition.split("___");
 
-    // 🔄 Use ownerId + namespace + key instead of ID
-    const delRes = await admin.graphql(`
-      mutation ($metafields: [MetafieldIdentifierInput!]!) {
-        metafieldsDelete(metafields: $metafields) {
-          userErrors { field message }
+    try {
+      const delRes = await admin.graphql(`
+        mutation ($metafields: [MetafieldIdentifierInput!]!) {
+          metafieldsDelete(metafields: $metafields) {
+            userErrors { field message }
+          }
         }
-      }
-    `, {
-      variables: {
-        metafields: [{ ownerId: productId, namespace, key }]
-      }
-    });
+      `, {
+        variables: {
+          metafields: [{ ownerId: productId, namespace, key }],
+        },
+      });
 
-    const delData = await delRes.json();
-    const errs = delData?.data?.metafieldsDelete?.userErrors || [];
+      const delData = await delRes.json();
+      const errs = delData?.data?.metafieldsDelete?.userErrors || [];
+      if (errs.length) {
+        return json({ success: false, errors: errs, intent, productId });
+      }
 
-    if (errs.length) {
-      return json({ success: false, errors: errs, intent, productId });
+      return json({ success: true, intent, productId });
+    } catch (err) {
+      console.error("Error clearing metafield:", err);
+      return json({ success: false, errors: [{ message: "Server error during metafield clearing." }], intent, productId });
     }
-
-    return json({ success: true, intent, productId });
   }
 
+  // -------- INVALID INTENT --------
   return json({ success: false, errors: [{ message: "Invalid action intent." }] });
 }
 
@@ -682,6 +786,82 @@ function CreateMetafieldDefinitionModal({ isOpen, onClose, onSubmit, isSubmittin
   );
 }
 
+// Converts 2D array of [specification, value] rows into HTML table string
+function generateTableHTML(tableData) {
+  let html = "<table>";
+  html += "<thead><tr><th>Specification</th><th>Value</th></tr></thead><tbody>";
+  for (const row of tableData) {
+    html += `<tr><td>${row[0] || ""}</td><td>${row[1] || ""}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  return html;
+}
+
+// TableBuilder UI component
+function TableBuilder({ data, onChange }) {
+  const addRow = () => onChange([...data, ["", ""]]);
+  const removeRow = (idx) => {
+    if (data.length <= 1) return;
+    onChange(data.filter((_, i) => i !== idx));
+  };
+  const updateCell = (rowIdx, colIdx, val) => {
+    const updated = data.map((row, i) =>
+      i === rowIdx ? row.map((cell, j) => (j === colIdx ? val : cell)) : row
+    );
+    onChange(updated);
+  };
+
+  return (
+    <div style={{ overflowX: "auto", maxWidth: "100%" }}>
+      <table style={{ borderCollapse: "collapse", width: "100%" }}>
+        <thead>
+          <tr>
+            <th style={{ border: "1px solid #ccc", padding: 6 }}>Specification</th>
+            <th style={{ border: "1px solid #ccc", padding: 6 }}>Value</th>
+            <th></th> {/* For remove button */}
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((row, idx) => (
+            <tr key={idx}>
+              {[0, 1].map((colIdx) => (
+                <td key={colIdx} style={{ border: "1px solid #ccc", padding: 6, minWidth: 100 }}>
+                  <input
+                    type="text"
+                    value={row[colIdx]}
+                    onChange={(e) => updateCell(idx, colIdx, e.target.value)}
+                    style={{ width: "100%", border: "none", outline: "none" }}
+                  />
+                </td>
+              ))}
+              <td>
+                <button
+                  type="button"
+                  onClick={() => removeRow(idx)}
+                  disabled={data.length <= 1}
+                  style={{ cursor: data.length <= 1 ? "not-allowed" : "pointer" }}
+                  title="Remove Row"
+                >
+                  −
+                </button>
+              </td>
+            </tr>
+          ))}
+          <tr>
+            <td colSpan={3} style={{ textAlign: "left", paddingTop: 6 }}>
+              <button type="button" onClick={addRow}>＋ Add Row</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+
+
+
+
 
 export default function ProductMetafieldEditor() {
   const { products, definitions } = useLoaderData();
@@ -704,6 +884,18 @@ export default function ProductMetafieldEditor() {
 
   // NEW: Metafield Definition Creation State
   const [showCreateModal, setShowCreateModal] = useState(false);
+
+  // Add inside ProductMetafieldEditor component, near your other useState calls
+  const [multiTextModeByProduct, setMultiTextModeByProduct] = useState({});
+  const [tableDataByProduct, setTableDataByProduct] = useState({});
+
+  // Bulk input mode for multiline text metafields: "plain" or "html" (table)
+  const [bulkMultiTextMode, setBulkMultiTextMode] = useState("plain");
+
+// Bulk table data for HTML mode: array of rows, each row is [specification, value]
+  const [bulkTableData, setBulkTableData] = useState([["", ""]]);
+
+
   
 
   // AUTOCOMPLETE MULTI for Products
@@ -757,6 +949,10 @@ const selectedOriginalType = selectedDefObj?.originalType || "";
 const isListType = selectedType.startsWith("list.");
 const isJsonType = selectedType === "json";
 const isFileType = selectedType === "file_reference";
+const isUrlType = selectedType === "url";
+const isColorType = selectedType === "color";
+
+
 
 
 
@@ -867,48 +1063,72 @@ const isFileType = selectedType === "file_reference";
     });
   };
 
-  // BULK SET (APPEND BULK VALUES TO EXISTING LISTS)
-  const handleBulkSet = () => {
-    const bulkItems = bulkListValue.filter(v => v && v.trim() !== ""); // <-- Applied here too, for safety
-    console.log("bulkItems:", bulkItems);
-    console.log("isListType:", isListType);
-    console.log("isJsonType:", isJsonType);
-    console.log("selectedProductIds:", selectedProductIds);
+ const handleBulkSet = () => {
+  // =========================
+  // 1. Multi-line Text Field: HTML TABLE MODE
+  // =========================
+  if (selectedType === "multi_line_text_field" && bulkMultiTextMode === "html") {
+    const newTableDataByProduct = { ...tableDataByProduct };
+    const newMultiTextModeByProduct = { ...multiTextModeByProduct };
+    selectedProductIds.forEach(pid => {
+      newTableDataByProduct[pid] = bulkTableData;
+      newMultiTextModeByProduct[pid] = "html";
+    });
+    setTableDataByProduct(newTableDataByProduct);
+    setMultiTextModeByProduct(newMultiTextModeByProduct);
+    console.log("Bulk set HTML table data and mode:", newTableDataByProduct, newMultiTextModeByProduct);
+    return;
+  }
 
-    if (isListType || (isJsonType && Array.isArray(bulkItems))) {
-      console.log("Inside list/json type block");
-      const updatedListValues = {};
+  // =========================
+  // 2. Multi-line Text Field: PLAIN TEXT MODE (this was missing/needed)
+  // =========================
+  if (selectedType === "multi_line_text_field" && bulkMultiTextMode === "plain") {
+    const newVals = { ...metafieldValues };
+    const newMultiTextModeByProduct = { ...multiTextModeByProduct };
+    selectedProductIds.forEach(pid => {
+      newVals[pid] = bulkValue;
+      newMultiTextModeByProduct[pid] = "plain";
+    });
+    setMetafieldValues(newVals);
+    setMultiTextModeByProduct(newMultiTextModeByProduct);
+    console.log("Bulk set plain text and mode:", newVals, newMultiTextModeByProduct);
+    return;
+  }
 
-      selectedProductIds.forEach(pid => {
-        // Ensure existing items are valid strings before processing
-        const existing = (listValues[pid] || []).filter(item => typeof item === 'string' && item.trim() !== ''); // <-- Crucial change here
-        console.log(`Processing PID: ${pid}, Existing (filtered):`, existing);
+  // =========================
+  // 3. LIST/JSON TYPES
+  // =========================
+  const bulkItems = bulkListValue.filter(v => v && v.trim() !== "");
+  if (isListType || (isJsonType && Array.isArray(bulkItems))) {
+    console.log("Inside list/json type block");
+    const updatedListValues = {};
+    selectedProductIds.forEach(pid => {
+      // Ensure existing items are valid strings before processing
+      const existing = (listValues[pid] || []).filter(item => typeof item === 'string' && item.trim() !== '');
+      console.log(`Processing PID: ${pid}, Existing (filtered):`, existing);
+      if (existing.length > 0) {
+        updatedListValues[pid] = [...existing, ...bulkItems];
+      } else {
+        updatedListValues[pid] = [...bulkItems];
+      }
+    });
+    console.log("updatedListValues before setListValues:", updatedListValues);
+    setListValues(updatedListValues);
+    return;
+  }
 
-        // If existing has list items, append bulk items
-        // Now, existing will only contain valid, non-empty strings.
-        if (existing.length > 0) { // Simpler check now that existing is filtered
-          console.log("Appending to existing list");
-          updatedListValues[pid] = [...existing, ...bulkItems];
-        } else {
-          // No existing valid values → assign bulk values directly
-          console.log("Assigning bulk items directly (no existing valid values)");
-          updatedListValues[pid] = [...bulkItems];
-        }
-      });
-
-      console.log("updatedListValues before setListValues:", updatedListValues);
-      setListValues(updatedListValues);
-    } else {
-      console.log("Inside non-list/json type block");
-      const newVals = {};
-      selectedProductIds.forEach(pid => {
-        newVals[pid] = bulkValue;
-      });
-      console.log("newVals before setMetafieldValues:", newVals);
-      setMetafieldValues(newVals);
-    }
-  };
-
+  // =========================
+  // 4. SCALAR (DEFAULT) TYPES
+  // =========================
+  console.log("Inside non-list/json type block");
+  const newVals = {};
+  selectedProductIds.forEach(pid => {
+    newVals[pid] = bulkValue;
+  });
+  console.log("newVals before setMetafieldValues:", newVals);
+  setMetafieldValues(newVals);
+};
 
   // FILE UPLOAD
   const handleFileChange = async (e, productId) => {
@@ -941,144 +1161,185 @@ const isFileType = selectedType === "file_reference";
     // eslint-disable-next-line
   }, [fetcher.data, uploadProductId]);
 
-  // BULK SUBMIT
   const handleBulkSubmit = (e) => {
-    e.preventDefault();
+  e.preventDefault();
 
-    const updates = selectedProductIds.map(pid => {
-      let value = "";
+  // Prepare update payload for each selected product
+  const updates = selectedProductIds.map(pid => {
+    let value = "";
 
-      if (isListType || (isJsonType && Array.isArray(listValues[pid]) && selectedOriginalType.startsWith("LIST."))) {
-        // If it's a Shopify LIST type or a JSON that holds an array (like a list)
-        const rawList = listValues[pid] || [""];
-        const cleanList = rawList.filter(v => v !== null && v.trim() !== ""); // Filter out null and empty strings
-        value = JSON.stringify(cleanList.length > 0 ? cleanList : []); // Ensure an empty array if all are empty
-      } else if (isJsonType) {
-        // If it's a general JSON type (not specifically a list)
-        value = metafieldValues[pid] ?? bulkValue ?? "";
-        try {
-            // Attempt to parse and re-stringify to validate/normalize JSON
-            value = JSON.stringify(JSON.parse(value));
-        } catch (e) {
-            console.warn("Invalid JSON for product", pid, ":", value);
-            // Handle invalid JSON, maybe return an error or a default
-            value = ""; // Or some other default/error indicator
-        }
-      } else {
-        // Scalar types (STRING, INTEGER, URL, etc.)
-        value = metafieldValues[pid] ?? bulkValue ?? "";
-      }
-
-      return { productId: pid, value };
-    });
-
-    // Filter out updates with empty or invalid values if type is not JSON or LIST.JSON and value is effectively empty
-    const filteredUpdates = updates.filter(({ value }) => {
-      if (isListType || (isJsonType && selectedOriginalType.startsWith("LIST."))) {
-        // For list types, empty JSON array is acceptable (clears list)
-        return true;
-      }
-      if (isJsonType) {
-        // For general JSON, if value is "{}", it's fine. If invalid, it might be filtered or handled by backend error.
-        return true;
-      }
-      // For other types, only proceed if value is not effectively empty
-      return value !== "" && value !== null && value !== undefined;
-    });
-
-    if (filteredUpdates.length === 0 && selectedDef) {
-        alert("No valid metafield values to save for the selected definition and products. All values are empty or invalid.");
-        return;
-    }
-
-
-    fetcher.submit(
-      {
-        intent: "updateMetafieldsBulk",
-        definition: selectedDef,
-        updates: JSON.stringify(updates),
-      },
-      { method: "post", action: "." }
-    );
-  };
-
-  // PER-ROW SUBMIT
-  const handleRowUpdate = (productId) => {
-    let value = metafieldValues[productId];
-    if (isListType || (isJsonType && Array.isArray(listValues[productId]) && selectedOriginalType.startsWith("LIST."))) {
-      const rawList = listValues[productId] || [""];
+    // Handle multi_line_text_field in "html" mode (table input)
+    if (selectedType === "multi_line_text_field" && multiTextModeByProduct[pid] === "html") {
+  value = generateTableHTML(tableDataByProduct[pid] || [["", ""]]);
+}
+    // Handle Shopify LIST types or JSON lists
+    else if (
+      isListType ||
+      (isJsonType && Array.isArray(listValues[pid]) && selectedOriginalType.startsWith("LIST."))
+    ) {
+      const rawList = listValues[pid] || [""];
       const cleanList = rawList.filter(v => v !== null && v.trim() !== "");
-      value = JSON.stringify(cleanList.length > 0 ? cleanList : []); // Ensure empty array if all are empty
-    } else if (isJsonType && metafieldValues[productId]) {
-      value = metafieldValues[productId];
+      // Send stringified JSON array, empty array if no valid items
+      value = JSON.stringify(cleanList.length > 0 ? cleanList : []);
+    }
+    // Handle general JSON types (non-list JSON)
+    else if (isJsonType) {
+      value = metafieldValues[pid] ?? bulkValue ?? "";
       try {
-          value = JSON.stringify(JSON.parse(value));
-      } catch (e) {
-          alert("Invalid JSON format for this metafield.");
-          return;
+        // Validate that value is valid JSON; if not, reset to empty string
+        value = JSON.stringify(JSON.parse(value));
+      } catch (err) {
+        console.warn("Invalid JSON for product", pid, ":", value);
+        value = "";
       }
     }
+    // Handle scalar types (string, integer, color, boolean, etc.)
+    else {
+      value = metafieldValues[pid] ?? bulkValue ?? "";
+    }
 
-    if (!value && !(isListType || isJsonType)) { // If it's a scalar type and value is empty, consider clearing
-      if (confirm("Value is empty. Do you want to clear this metafield for this product?")) {
-        handleRowClear(productId);
-      }
+    return { productId: pid, value };
+  });
+
+  // Filter to allow all list/JSON updates, but ignore empty scalar values
+  const filteredUpdates = updates.filter(({ value }) => {
+    if (isListType || (isJsonType && selectedOriginalType.startsWith("LIST."))) {
+      return true; // accept all JSON lists (even empty arrays)
+    }
+    if (isJsonType) {
+      return true; // accept all JSON, backend handles validation
+    }
+    // For scalar types, ignore empty or null values
+    return value !== "" && value !== null && value !== undefined;
+  });
+
+  if (filteredUpdates.length === 0 && selectedDef) {
+    alert("No valid metafield values to save for the selected definition and products. All values are empty or invalid.");
+    return;
+  }
+
+  // Submit updates (you can switch to filteredUpdates here if you want to only submit valid entries)
+  fetcher.submit(
+    {
+      intent: "updateMetafieldsBulk",
+      definition: selectedDef,
+      updates: JSON.stringify(updates),
+    },
+    { method: "post", action: "." }
+  );
+};
+  // PER-ROW SUBMIT
+const handleRowUpdate = (productId) => {
+  let value = "";
+
+  // Handle multiline_text_field with "html" input mode (Table Builder)
+  if (selectedType === "multi_line_text_field" && multiTextModeByProduct[productId] === "html") {
+    const tableData = tableDataByProduct[productId] || [["", ""]];
+    value = generateTableHTML(tableData); // Convert table data to HTML string
+  } else if (isListType || (isJsonType && Array.isArray(listValues[productId]) && selectedOriginalType.startsWith("LIST."))) {
+    const rawList = listValues[productId] || [""];
+    const cleanList = rawList.filter(v => v !== null && v.trim() !== "");
+    value = JSON.stringify(cleanList.length > 0 ? cleanList : []); // Ensure empty array if all empty
+  } else if (isJsonType && metafieldValues[productId]) {
+    value = metafieldValues[productId];
+    try {
+      value = JSON.stringify(JSON.parse(value));
+    } catch (e) {
+      alert("Invalid JSON format for this metafield.");
       return;
     }
+  } else {
+    value = metafieldValues[productId] || "";
+  }
 
-    fetcher.submit(
-      {
-        intent: "updateMetafield",
-        productId,
-        definition: selectedDef,
-        value,
-      },
-      { method: "post", action: "." }
-    );
-  };
-
-  const handleRowClear = (productId) => {
-    fetcher.submit(
-      {
-        intent: "clearMetafield",
-        productId,
-        definition: selectedDef,      // "namespace___key___originalType"
-      },
-      { method: "post", action: "." }
-    );
-  };
-
-  // Success/error feedback per row
-  useEffect(() => {
-    if (fetcher.data?.intent === "updateMetafieldsBulk" && fetcher.data?.results) {
-      const s = {}, e = {};
-      fetcher.data.results.forEach(r => {
-        if (r.success) s[r.productId] = true;
-        else e[r.productId] = r.errors?.map(x => x.message).join(", ") || "Error";
-      });
-      setSuccessMap(s);
-      setErrorMap(e);
+  if (!value && !(isListType || isJsonType)) { // For scalar types, prompt before clearing
+    if (confirm("Value is empty. Do you want to clear this metafield for this product?")) {
+      handleRowClear(productId);
     }
-    if (fetcher.data?.intent === "updateMetafield" && fetcher.data?.productId) {
-      if (fetcher.data.success) setSuccessMap((prev) => ({ ...prev, [fetcher.data.productId]: true }));
-      else setErrorMap((prev) => ({ ...prev, [fetcher.data.productId]: fetcher.data.errors?.map(x => x.message).join(", ") || "Error" }));
-    }
+    return;
+  }
 
-    if (fetcher.data?.intent === "clearMetafield" && fetcher.data?.productId) {
-      const pid = fetcher.data.productId;
-      if (fetcher.data.success) {
-        setMetafieldValues(prev => ({ ...prev, [pid]: "" }));
-        setListValues(prev => ({ ...prev, [pid]: [""] }));
-        setSuccessMap(prev => ({ ...prev, [pid]: true }));
-        setErrorMap(prev => ({ ...prev, [pid]: undefined }));
-      } else {
-        setErrorMap(prev => ({
-          ...prev,
-          [pid]: fetcher.data.errors?.map(e => e.message).join(", ") || "Error",
-        }));
-      }
+  fetcher.submit(
+    {
+      intent: "updateMetafield",
+      productId,
+      definition: selectedDef,
+      value,
+    },
+    { method: "post", action: "." }
+  );
+};
+
+
+const handleRowClear = (productId) => {
+  fetcher.submit(
+    {
+      intent: "clearMetafield",
+      productId,
+      definition: selectedDef, // "namespace___key___originalType"
+    },
+    { method: "post", action: "." }
+  );
+};
+
+
+// Success/error feedback per row
+useEffect(() => {
+  if (fetcher.data?.intent === "updateMetafieldsBulk" && fetcher.data?.results) {
+    const s = {}, e = {};
+    fetcher.data.results.forEach(r => {
+      if (r.success) s[r.productId] = true;
+      else e[r.productId] = r.errors?.map(x => x.message).join(", ") || "Error";
+    });
+    setSuccessMap(s);
+    setErrorMap(e);
+  }
+  if (fetcher.data?.intent === "updateMetafield" && fetcher.data?.productId) {
+    if (fetcher.data.success) setSuccessMap((prev) => ({ ...prev, [fetcher.data.productId]: true }));
+    else setErrorMap((prev) => ({ ...prev, [fetcher.data.productId]: fetcher.data.errors?.map(x => x.message).join(", ") || "Error" }));
+  }
+
+  if (fetcher.data?.intent === "clearMetafield" && fetcher.data?.productId) {
+    const pid = fetcher.data.productId;
+    if (fetcher.data.success) {
+      setMetafieldValues(prev => ({ ...prev, [pid]: "" }));
+      setListValues(prev => ({ ...prev, [pid]: [""] }));
+      setSuccessMap(prev => ({ ...prev, [pid]: true }));
+      setErrorMap(prev => ({ ...prev, [pid]: undefined }));
+    } else {
+      setErrorMap(prev => ({
+        ...prev,
+        [pid]: fetcher.data.errors?.map(e => e.message).join(", ") || "Error",
+      }));
     }
-  }, [fetcher.data]);
+  }
+}, [fetcher.data]);
+
+
+// Handle Definition Creation feedback
+useEffect(() => {
+  if (definitionFetcher.data?.intent === "createMetafieldDefinition") {
+    if (definitionFetcher.data.success) {
+      setShowCreateModal(false);
+      // Optionally refresh definitions here, or reload page if needed
+    } else {
+      alert(definitionFetcher.data.errors?.map(e => e.message).join(", ") || "Failed to create metafield definition.");
+    }
+  }
+}, [definitionFetcher.data]);
+
+
+useEffect(() => {
+  if (selectedDef) {
+    const selectedObj = definitionOptions.find(d => d.value === selectedDef);
+    if (selectedObj) {
+      setDefSearch(selectedObj.label);
+    }
+  } else {
+    setDefSearch("");
+  }
+}, [selectedDef, definitionOptions]);
+
 
   // Handle Definition Creation feedback
   useEffect(() => {
@@ -1111,462 +1372,560 @@ const isFileType = selectedType === "file_reference";
 }, [selectedDef, definitionOptions]);
 
 
-
-  // UI
-  return (
-    <Page title="🚧 Metafield Workbench">
-      <Layout>
-        <Layout.Section>
-          <Card sectioned spacing="loose">
-            <form onSubmit={handleBulkSubmit}>
-              {/* Selected Products as Chips */}
-              {selectedProductIds.length > 0 && (
-                <div style={{ marginBottom: "1rem", display: "flex", flexWrap: "wrap", gap: "8px" }}>
-                  {selectedProductIds.map(pid => {
-                    const product = productOptions.find(p => p.value === pid);
-                    return (
-                      <span
-                        key={pid}
+return (
+  <Page title="🚧 Metafield Workbench">
+    <Layout>
+      <Layout.Section>
+        <Card sectioned spacing="loose">
+          <form onSubmit={handleBulkSubmit}>
+            {/* Selected Products as Chips */}
+            {selectedProductIds.length > 0 && (
+              <div style={{ marginBottom: "1rem", display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                {selectedProductIds.map(pid => {
+                  const product = productOptions.find(p => p.value === pid);
+                  return (
+                    <span
+                      key={pid}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        background: "linear-gradient(90deg, #f8f9f8ff 0%, #efcdf8ff 100%)",
+                        color: "#1e293b",
+                        fontWeight: 600,
+                        borderRadius: "16px",
+                        padding: "6px 14px 6px 12px",
+                        fontSize: "12px",
+                        boxShadow: "0 2px 6px #fbbf2430",
+                        border: "1px solid #f59e42",
+                        marginRight: "4px",
+                      }}
+                    >
+                      {product?.label}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveProduct(pid)}
                         style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          background: "linear-gradient(90deg, #f8f9f8ff 0%, #efcdf8ff 100%)",
-                          color: "#1e293b",
-                          fontWeight: 600,
-                          borderRadius: "16px",
-                          padding: "6px 14px 6px 12px",
-                          fontSize: "12px",
-                          boxShadow: "0 2px 6px #fbbf2430",
-                          border: "1px solid #f59e42",
-                          marginRight: "4px",
+                          background: "none",
+                          border: "none",
+                          color: "#d97706",
+                          fontWeight: "bold",
+                          fontSize: "15px",
+                          marginLeft: "8px",
+                          cursor: "pointer",
+                          lineHeight: 1,
                         }}
+                        title="Remove"
+                        aria-label="Remove"
                       >
-                        {product?.label}
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveProduct(pid)}
-                          style={{
-                            background: "none",
-                            border: "none",
-                            color: "#d97706",
-                            fontWeight: "bold",
-                            fontSize: "15px",
-                            marginLeft: "8px",
-                            cursor: "pointer",
-                            lineHeight: 1,
-                          }}
-                          title="Remove"
-                          aria-label="Remove"
-                        >×</button>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
-              {/* Product Multi-Select */}
-              <div style={{ marginBottom: "1.5rem" }}>
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Product Multi-Select */}
+            <div style={{ marginBottom: "1.5rem" }}>
+              <Autocomplete
+                options={filteredProductOptions}
+                selected={[]}
+                onSelect={handleProductSelect}
+                allowMultiple
+                textField={
+                  <Autocomplete.TextField
+                    label="Search Products"
+                    value={productSearch}
+                    onChange={setProductSearch}
+                    placeholder="Search Product Name"
+                    autoComplete="off"
+                  />
+                }
+              />
+            </div>
+
+            {/* Definition Dropdown */}
+            <div style={{ marginBottom: "1.5rem", display: 'flex', alignItems: 'flex-end', gap: '1rem' }}>
+              <div style={{ flexGrow: 1 }}>
                 <Autocomplete
-                  options={filteredProductOptions}
-                  selected={[]}
-                  onSelect={handleProductSelect}
-                  allowMultiple
+                  options={filteredDefs}
+                  selected={selectedDef ? [selectedDef] : []}
+                  onSelect={(selected) => {
+                    setSelectedDef(selected[0] || "");
+                    setDefSearch("");
+                    // Clear related states as needed
+                    setMetafieldValues({});
+                    setListValues({});
+                    setSuccessMap({});
+                    setErrorMap({});
+                  }}
                   textField={
                     <Autocomplete.TextField
-                      label="Search Products"
-                      value={productSearch}
-                      onChange={setProductSearch}
-                      placeholder="Search Product Name"
+                      label="Metafield Definition"
+                      value={defSearch}
+                      onChange={setDefSearch}
+                      placeholder="Search metafield definitions"
+                      clearButton
+                      onClearButtonClick={() => setDefSearch("")}
                       autoComplete="off"
                     />
                   }
                 />
               </div>
-              {/* Definition Dropdown */}
-              {/* Definition Dropdown with Search */}
-<div style={{ marginBottom: "1.5rem", display: 'flex', alignItems: 'flex-end', gap: '1rem' }}>
-  <div style={{ flexGrow: 1 }}>
-    <Autocomplete
-  options={filteredDefs}
-  selected={selectedDef ? [selectedDef] : []}  // must be array with selectedDef string
-  onSelect={(selected) => {
-    setSelectedDef(selected[0] || "");
-    setDefSearch("");
-    // Clear related states as needed
-    setMetafieldValues({});
-    setListValues({});
-    setSuccessMap({});
-    setErrorMap({});
-  }}
-  textField={
-    <Autocomplete.TextField
-  label="Metafield Definition"
-  value={defSearch}
-  onChange={setDefSearch}
-  placeholder="Search metafield definitions"
-  clearButton
-  onClearButtonClick={() => setDefSearch("")}
-  autoComplete="off"
-/>
+              <Button onClick={() => setShowCreateModal(true)}>
+                Create New Definition
+              </Button>
+            </div>
 
-  }
-/>
+            {/* Bulk Set */}
+            {selectedProductIds.length > 1 && selectedDef && (
+              <div style={{ marginBottom: "1.5rem" }}>
+                <Text as="p" variant="bodyMd" style={{ fontWeight: 700, color: "#97530bff", marginBottom: 8 }}>
+                  Bulk set value for all selected products:
+                </Text>
 
-  </div>
-  <Button onClick={() => setShowCreateModal(true)}>
-    Create New Definition
-  </Button>
-</div>
-
-              {/* Bulk Set */}
-              {selectedProductIds.length > 1 && selectedDef && (
-                <div style={{ marginBottom: "1.5rem" }}>
-                  <Text as="p" variant="bodyMd" style={{ fontWeight: 700, color: "#97530bff", marginBottom: 8 }}>
-                    Bulk set value for all selected products:
-                  </Text>
-                  {isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
-                    <>
-                      {bulkListValue.map((item, idx) => (
-                        <div key={idx} style={{
-                          display: "flex",
-                          alignItems: "center",
-                          marginBottom: "0.5rem",
-                          background: "#fffbe8",
-                          border: "1.5px solid #fde68a",
-                          borderRadius: "6px",
-                          padding: "0.5rem",
-                          boxShadow: "0 1px 8px #fde68a40"
-                        }}>
-                          <TextField
-                            value={item}
-                            onChange={val => {
-                              const arr = [...bulkListValue];
-                              arr[idx] = val;
-                              setBulkListValue(arr);
-                            }}
-                            multiline
-                            autoComplete="off"
-                            fullWidth
-                            label={idx === 0 ? <span style={{ color: "#5f2864ff", fontWeight: 700 }}>Bulk List Item</span> : undefined}
-                            labelHidden={idx !== 0}
-                            style={{
-                              fontWeight: 700,
-                              color: "#5e2a86ff",
-                              background: "transparent",
-                              border: "none",
-                              outline: "none"
-                            }}
-                          />
-                          {bulkListValue.length > 1 && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const arr = [...bulkListValue];
-                                arr.splice(idx, 1);
-                                setBulkListValue(arr.length ? arr : [""]);
-                              }}
-                              style={{
-                                backgroundColor: "#fde68a",
-                                color: "#fff",
-                                border: "none",
-                                width: "32px",
-                                height: "32px",
-                                borderRadius: "4px",
-                                cursor: "pointer",
-                                marginLeft: "8px",
-                                fontWeight: "bold",
-                                fontSize: "18px",
-                              }}
-                            >−</button>
-                          )}
-                        </div>
-                      ))}
-                      <button
-                        type="button"
-                        onClick={() => setBulkListValue([...bulkListValue, ""])}
-                        style={{
-                          background: "linear-gradient(90deg, #ece0b3ff 0%, #f6b4ccff 100%)",
-                          color: "#000000ff",
-                          border: "none",
-                          padding: "6px 12px",
-                          borderRadius: "4px",
-                          cursor: "pointer",
-                          marginTop: "0.5rem",
-                          fontWeight: 700,
-                          fontSize: "14px",
-                          boxShadow: "0 2px 6px #fde68a50"
-                        }}
-                      >＋ Add List Item</button>
-                    </>
-                  ) : selectedType === "color" ? (
-                    <TextField
-                      label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value (Color)</span>}
-                      value={bulkValue}
-                      onChange={setBulkValue}
-                      type="color"
-                      autoComplete="off"
-                      fullWidth
-                      style={{
-                        fontWeight: 700,
-                        color: "#f59e42",
-                        background: "#fffbe8",
-                        border: "1.5px solid #fde68a",
-                        borderRadius: "6px",
-                        boxShadow: "0 1px 8px #fde68a40"
-                      }}
-                    />
-                  ) : selectedType === "boolean" ? (
+                {selectedType === "multi_line_text_field" ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                    {/* Bulk Input Mode Selector */}
                     <Select
-                      label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value (Boolean)</span>}
+                      label="Bulk Input Mode"
                       options={[
-                        { label: "Select...", value: "" },
-                        { label: "True", value: "true" },
-                        { label: "False", value: "false" }
+                        { label: "Plain Text", value: "plain" },
+                        { label: "HTML Table", value: "html" },
                       ]}
-                      value={bulkValue}
-                      onChange={setBulkValue}
+                      value={bulkMultiTextMode}
+                      onChange={(val) => {
+                        setBulkMultiTextMode(val);
+                        if (val !== "html") {
+                          setBulkTableData([["", ""]]); // Reset table data for leaving html mode
+                        } else if (!bulkTableData || bulkTableData.length === 0) {
+                          setBulkTableData([["", ""]]); // Initialize for html mode
+                        }
+                      }}
                     />
-                  ) : (
-                    <TextField
-                      value={bulkValue}
-                      onChange={setBulkValue}
-                      label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value</span>}
-                      autoComplete="off"
-                      fullWidth
-                      multiline={selectedType === "multi_line_text_field" || selectedType === "rich_text_field" || selectedType === "json"}
-                      type={selectedType === "integer" || selectedType === "float" ? "number" : "text"}
-                      style={{
-                        fontWeight: 700,
-                        color: "#f59e42",
+
+                    {/* Plain Text Bulk Input */}
+                    {bulkMultiTextMode === "plain" && (
+                      <TextField
+                        label="Bulk Value (Plain Text)"
+                        value={bulkValue}
+                        onChange={setBulkValue}
+                        multiline
+                        autoComplete="off"
+                        fullWidth
+                        placeholder="Enter plain text here"
+                      />
+                    )}
+
+                    
+                    
+
+                    {/* HTML Table Bulk Input */}
+                    {bulkMultiTextMode === "html" && (
+                      <>
+                        <TableBuilder
+                          data={bulkTableData}
+                          onChange={setBulkTableData}
+                        />
+                        <TextField
+                          label="Generated HTML Preview"
+                          multiline
+                          readOnly
+                          autoComplete="off"
+                          value={generateTableHTML(bulkTableData)}
+                          helpText="This HTML markup will be saved as the bulk metafield value."
+                          style={{ marginTop: "12px", fontFamily: "monospace" }}
+                          fullWidth
+                        />
+                      </>
+                    )}
+                  </div>
+                ) : isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
+                  <>
+                    {bulkListValue.map((item, idx) => (
+                      <div key={idx} style={{
+                        display: "flex",
+                        alignItems: "center",
+                        marginBottom: "0.5rem",
                         background: "#fffbe8",
                         border: "1.5px solid #fde68a",
                         borderRadius: "6px",
+                        padding: "0.5rem",
                         boxShadow: "0 1px 8px #fde68a40"
+                      }}>
+                        <TextField
+                          value={item}
+                          onChange={val => {
+                            const arr = [...bulkListValue];
+                            arr[idx] = val;
+                            setBulkListValue(arr);
+                          }}
+                          multiline
+                          autoComplete="off"
+                          fullWidth
+                          label={idx === 0 ? <span style={{ color: "#5f2864ff", fontWeight: 700 }}>Bulk List Item</span> : undefined}
+                          labelHidden={idx !== 0}
+                          style={{
+                            fontWeight: 700,
+                            color: "#5e2a86ff",
+                            background: "transparent",
+                            border: "none",
+                            outline: "none"
+                          }}
+                        />
+                        {bulkListValue.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const arr = [...bulkListValue];
+                              arr.splice(idx, 1);
+                              setBulkListValue(arr.length ? arr : [""]);
+                            }}
+                            style={{
+                              backgroundColor: "#fde68a",
+                              color: "#fff",
+                              border: "none",
+                              width: "32px",
+                              height: "32px",
+                              borderRadius: "4px",
+                              cursor: "pointer",
+                              marginLeft: "8px",
+                              fontWeight: "bold",
+                              fontSize: "18px",
+                            }}
+                          >−</button>
+                        )}
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setBulkListValue([...bulkListValue, ""])}
+                      style={{
+                        background: "linear-gradient(90deg, #ece0b3ff 0%, #f6b4ccff 100%)",
+                        color: "#000000ff",
+                        border: "none",
+                        padding: "6px 12px",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                        marginTop: "0.5rem",
+                        fontWeight: 700,
+                        fontSize: "14px",
+                        boxShadow: "0 2px 6px #fde68a50"
                       }}
-                    />
-                  )}
-                  <Button onClick={handleBulkSet} style={{
-                    marginTop: "0.5rem",
-                    background: "linear-gradient(90deg, #fde68a 0%, #fbbf24 100%)",
-                    color: "#b45309",
-                    fontWeight: 700,
-                    fontSize: "15px",
-                    border: "none",
-                    borderRadius: "6px",
-                    boxShadow: "0 2px 6px #fde68a50"
-                  }}>
-                    Set All Values
-                  </Button>
-                </div>
-              )}
-              {/* Table/List of Products */}
-              {selectedDef && selectedProductIds.length > 0 && (
-                <div style={{ marginBottom: "1.5rem" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr>
-                        <th style={{ textAlign: "left", padding: "8px" }}>Product</th>
-                        <th style={{ textAlign: "left", padding: "8px" }}>Metafield Value</th>
-                        <th style={{ textAlign: "left", padding: "8px" }}>Update</th>
-                        <th style={{ textAlign: "left", padding: "8px" }}>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {selectedProductIds.map(pid => {
-                        const product = productOptions.find(p => p.value === pid);
-                        let value = metafieldValues[pid] || "";
-                        let listVal = listValues[pid] || [""];
-                        return (
-                          <tr key={pid} style={{ borderBottom: "1px solid #eee" }}>
-                            <td style={{ padding: "8px", verticalAlign: "top" }}>
-                              <Text as="span" variant="bodyMd">{product?.label}</Text>
-                            </td>
-                            <td style={{ padding: "8px", verticalAlign: "top" }}>
-                              {isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
-                                <>
-                                  {listVal.map((item, idx) => (
-                                    <div key={idx} style={{ display: "flex", alignItems: "center", marginBottom: "0.5rem" }}>
-                                      <TextField
-                                        value={item}
-                                        onChange={val => handleListValueChange(pid, idx, val)}
-                                        multiline
-                                        autoComplete="off"
-                                        fullWidth
-                                        label={idx === 0 ? "Metafield Value (List Item)" : undefined}
-                                        labelHidden={idx !== 0}
-                                      />
-                                      {listVal.length > 1 && (
-                                        <button
-                                          type="button"
-                                          onClick={() => handleRemoveListItem(pid, idx)}
-                                          style={{
-                                            backgroundColor: "#f37b7bff",
-                                            color: "white",
-                                            border: "none",
-                                            width: "28px",
-                                            height: "22px",
-                                            borderRadius: "4px",
-                                            cursor: "pointer",
-                                            marginLeft: "8px",
-                                          }}
-                                        >−</button>
-                                      )}
-                                    </div>
-                                  ))}
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAddListItem(pid)}
-                                    style={{
-                                      backgroundColor: "#7fabf0ff",
-                                      color: "white",
-                                      border: "none",
-                                      padding: "3px 9px",
-                                      borderRadius: "4px",
-                                      cursor: "pointer",
-                                      marginTop: "0.5rem",
-                                    }}
-                                  >＋ Add List Item</button>
-                                </>
-                              ) : selectedType === "color" ? (
-                                <label>
-                                  <Text as="p" variant="bodyMd">Metafield Value</Text>
-                                  <input
-                                    type="color"
-                                    value={value}
-                                    onChange={e => handleValueChange(pid, e.target.value)}
-                                    style={{ width: "100px", height: "40px", border: "1px solid #c4c4c4", borderRadius: "4px" }}
-                                  />
-                                </label>
-                              ) : isFileType ? ( // Handle FILE_REFERENCE type
-                                <>
-                                  <Text as="p" variant="bodyMd">Upload File (or enter a URL)</Text>
-                                  <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
-                                    <Button
-                                      onClick={() => {
-                                        setUploadProductId(pid);
-                                        fileInputRef.current?.click();
-                                      }}
-                                      disabled={uploading}
-                                    >Upload File</Button>
-                                    <input
-                                      type="file"
-                                      // accept="application/pdf" // Removed specific accept for generic files
-                                      style={{ display: "none" }}
-                                      ref={fileInputRef}
-                                      onChange={e => handleFileChange(e, pid)}
-                                    />
-                                    {uploading && uploadProductId === pid && (
-                                      <Text as="span" variant="bodySm" color="subdued">
-                                        Uploading...
-                                      </Text>
-                                    )}
-                                  </div>
+                    >＋ Add List Item</button>
+                  </>
+                ) : selectedType === "color" ? (
+                  <TextField
+                    label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value (Color)</span>}
+                    value={bulkValue}
+                    onChange={setBulkValue}
+                    type="color"
+                    autoComplete="off"
+                    fullWidth
+                    style={{
+                      fontWeight: 700,
+                      color: "#f59e42",
+                      background: "#fffbe8",
+                      border: "1.5px solid #fde68a",
+                      borderRadius: "6px",
+                      boxShadow: "0 1px 8px #fde68a40"
+                    }}
+                  />
+                ) : selectedType === "boolean" ? (
+                  <Select
+                    label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value (Boolean)</span>}
+                    options={[
+                      { label: "Select...", value: "" },
+                      { label: "True", value: "true" },
+                      { label: "False", value: "false" }
+                    ]}
+                    value={bulkValue}
+                    onChange={setBulkValue}
+                  />
+                ) : (
+                  <TextField
+                    value={bulkValue}
+                    onChange={setBulkValue}
+                    label={<span style={{ color: "#f59e42", fontWeight: 700 }}>Bulk Value</span>}
+                    autoComplete="off"
+                    fullWidth
+                    multiline={selectedType === "multi_line_text_field" || selectedType === "rich_text_field" || selectedType === "json"}
+                    type={selectedType === "integer" || selectedType === "float" ? "number" : "text"}
+                    style={{
+                      fontWeight: 700,
+                      color: "#f59e42",
+                      background: "#fffbe8",
+                      border: "1.5px solid #fde68a",
+                      borderRadius: "6px",
+                      boxShadow: "0 1px 8px #fde68a40"
+                    }}
+                  />
+                )}
+
+                <Button onClick={handleBulkSet} style={{
+                  marginTop: "0.5rem",
+                  background: "linear-gradient(90deg, #fde68a 0%, #fbbf24 100%)",
+                  color: "#b45309",
+                  fontWeight: 700,
+                  fontSize: "15px",
+                  border: "none",
+                  borderRadius: "6px",
+                  boxShadow: "0 2px 6px #fde68a50"
+                }}>
+                  Set All Values
+                </Button>
+              </div>
+            )}
+
+            {/* Table/List of Products */}
+            {selectedDef && selectedProductIds.length > 0 && (
+              <div style={{ marginBottom: "1.5rem" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Product</th>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Metafield Value</th>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Update</th>
+                      <th style={{ textAlign: "left", padding: "8px" }}>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedProductIds.map(pid => {
+                      const product = productOptions.find(p => p.value === pid);
+                      let value = metafieldValues[pid] || "";
+                      let listVal = listValues[pid] || [""];
+
+                      return (
+                        <tr key={pid} style={{ borderBottom: "1px solid #eee" }}>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            <Text as="span" variant="bodyMd">{product?.label}</Text>
+                          </td>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            {selectedType === "multi_line_text_field" ? (
+                              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                                {/* Input mode selector */}
+                                <Select
+                                  label="Input Mode"
+                                  options={[
+                                    { label: "Plain Text", value: "plain" },
+                                    { label: "HTML Table", value: "html" },
+                                  ]}
+                                  value={multiTextModeByProduct[pid] || "plain"}
+                                  onChange={(val) => {
+                                    setMultiTextModeByProduct(prev => ({ ...prev, [pid]: val }));
+                                    if (val !== "html") {
+                                      setTableDataByProduct(prev => {
+                                        const copy = { ...prev };
+                                        delete copy[pid];
+                                        return copy;
+                                      });
+                                    } else if (!tableDataByProduct[pid]) {
+                                      setTableDataByProduct(prev => ({ ...prev, [pid]: [["", ""]] }));
+                                    }
+                                  }}
+                                />
+                                {/* Plain text input */}
+                                {multiTextModeByProduct[pid] === "plain" && (
                                   <TextField
-                                    label="Metafield Value (URL)"
-                                    value={value}
-                                    onChange={val => handleValueChange(pid, val)}
+                                    label="Plain Text"
+                                    value={metafieldValues[pid] || ""}
+                                    onChange={(val) => handleValueChange(pid, val)}
+                                    multiline
                                     autoComplete="off"
                                     fullWidth
-                                    placeholder="Paste a URL or upload a file"
+                                    placeholder="Enter plain text here"
                                   />
-                                </>
-                              ) : selectedType === "boolean" ? (
-                                <Select
-                                  label="Metafield Value"
-                                  options={[
-                                    { label: "Select...", value: "" },
-                                    { label: "True", value: "true" },
-                                    { label: "False", value: "false" }
-                                  ]}
-                                  value={value}
-                                  onChange={val => handleValueChange(pid, val)}
-                                />
-                              ) : (
-                                <TextField
-                                  label="Metafield Value"
-                                  value={value}
-                                  onChange={val => handleValueChange(pid, val)}
-                                  multiline={selectedType === "multi_line_text_field" || selectedType === "rich_text_field" || selectedType === "json"}
-                                  autoComplete="off"
-                                  fullWidth
-                                  type={selectedType === "integer" || selectedType === "float" ? "number" : "text"}
-                                />
-                              )}
-                            </td>
-                            <td style={{ padding: "8px", verticalAlign: "top", }}>
-                              <Button
-                                onClick={e => { e.preventDefault(); handleRowUpdate(pid); }}
-                                size="slim"
-                                disabled={uploading}
-                              >Update</Button>
-                              <Button
-                                destructive
-                                size="slim"
-                                onClick={e => { e.preventDefault(); handleRowClear(pid); }}
-                                disabled={uploading}
-                                style={{ marginLeft: "6px" }}
-                              >
-                                Clear Values
-                              </Button>
-                            </td>
-                            <td style={{ padding: "8px", verticalAlign: "top" }}>
-                              {successMap[pid] && (
-                                <Text variant="bodyMd" color="success">✅</Text>
-                              )}
-                              {errorMap[pid] && (
-                                <Text variant="bodyMd" color="critical">{errorMap[pid]}</Text>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              {/* Save/Update Button */}
-              <Button
-                submit
-                primary
-                loading={fetcher.state === "submitting" || fetcher.state === "loading"}
-                disabled={
-                  !selectedProductIds.length ||
-                  !selectedDef ||
-                  uploading ||
-                  fetcher.state === "submitting" ||
-                  fetcher.state === "loading"
-                }
-                style={{
-                  backgroundColor: "#16a34a",
-                  color: "white",
-                  padding: "10px 20px",
-                  borderRadius: "6px",
-                }}
-              >
-                Save All Metafields
-              </Button>
-            </form>
-          </Card>
-        </Layout.Section>
-      </Layout>
-
-      {/* NEW: Metafield Definition Creation Modal */}
-      <CreateMetafieldDefinitionModal
-        isOpen={showCreateModal}
-        onClose={() => setShowCreateModal(false)}
-        onSubmit={(definitionData) => {
-          const formData = new FormData();
-          formData.append("intent", "createMetafieldDefinition");
-          formData.append("namespace", definitionData.namespace);
-          formData.append("key", definitionData.key);
-          formData.append("name", definitionData.name);
-          formData.append("type", reverseTypeMap[definitionData.type] || definitionData.type); // 🚨 This is the fix
-          formData.append("description", definitionData.description);
-          definitionFetcher.submit(formData, { method: "post", action: "." });
+                                )}
+                                {/* Table builder with live HTML preview */}
+                                {multiTextModeByProduct[pid] === "html" && (
+                                  <>
+                                    <TableBuilder
+                                      data={tableDataByProduct[pid] || [["", ""]]}
+                                      onChange={(newTable) => setTableDataByProduct(prev => ({ ...prev, [pid]: newTable }))}
+                                    />
+                                    <TextField
+                                      label="Generated HTML Preview"
+                                      multiline
+                                      readOnly
+                                      value={generateTableHTML(tableDataByProduct[pid] || [["", ""]])}
+                                      helpText="This HTML markup will be saved as the metafield value."
+                                      style={{ marginTop: "12px", fontFamily: "monospace" }}
+                                      fullWidth
+                                    />
+                                  </>
+                                )}
+                              </div>
+                            ) : isListType || (isJsonType && selectedOriginalType.startsWith("LIST.")) ? (
+                              <>
+                                {listVal.map((item, idx) => (
+                                  <div key={idx} style={{ display: "flex", alignItems: "center", marginBottom: "0.5rem" }}>
+                                    <TextField
+                                      value={item}
+                                      onChange={val => handleListValueChange(pid, idx, val)}
+                                      multiline
+                                      autoComplete="off"
+                                      fullWidth
+                                      label={idx === 0 ? "Metafield Value (List Item)" : undefined}
+                                      labelHidden={idx !== 0}
+                                    />
+                                    {listVal.length > 1 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRemoveListItem(pid, idx)}
+                                        style={{
+                                          backgroundColor: "#f37b7bff",
+                                          color: "white",
+                                          border: "none",
+                                          width: "28px",
+                                          height: "22px",
+                                          borderRadius: "4px",
+                                          cursor: "pointer",
+                                          marginLeft: "8px",
+                                        }}
+                                      >−</button>
+                                    )}
+                                  </div>
+                                ))}
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddListItem(pid)}
+                                  style={{
+                                    backgroundColor: "#7fabf0ff",
+                                    color: "white",
+                                    border: "none",
+                                    padding: "3px 9px",
+                                    borderRadius: "4px",
+                                    cursor: "pointer",
+                                    marginTop: "0.5rem",
+                                  }}
+                                >＋ Add List Item</button>
+                              </>
+                            ) : (isFileType || isUrlType) ? (
+  <>
+    <Text as="p" variant="bodyMd">Upload File (or enter a URL)</Text>
+    <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+      <Button
+        onClick={() => {
+          setUploadProductId(pid);
+          fileInputRef.current?.click();
         }}
-        isSubmitting={definitionFetcher.state === "submitting" || definitionFetcher.state === "loading"}
-        errors={definitionFetcher.data?.errors}
+        disabled={uploading}
+      >
+        Upload File
+      </Button>
+      <input
+        type="file"
+        style={{ display: "none" }}
+        ref={fileInputRef}
+        onChange={e => handleFileChange(e, pid)}
+      />
+      {uploading && uploadProductId === pid && (
+        <Text as="span" variant="bodySm" color="subdued">Uploading...</Text>
+      )}
+    </div>
+    <TextField
+      label="Metafield Value (URL)"
+      value={value}
+      onChange={val => handleValueChange(pid, val)}
+      autoComplete="off"
+      fullWidth
+      placeholder="Paste a URL or upload a file"
     />
+  </>
+                            ) : selectedType === "boolean" ? (
+                              <Select
+                                label="Metafield Value"
+                                options={[
+                                  { label: "Select...", value: "" },
+                                  { label: "True", value: "true" },
+                                  { label: "False", value: "false" }
+                                ]}
+                                value={value}
+                                onChange={val => handleValueChange(pid, val)}
+                              />
+                            ) : (
+                              <TextField
+                                label="Metafield Value"
+                                value={value}
+                                onChange={val => handleValueChange(pid, val)}
+                                multiline={selectedType === "rich_text_field" || selectedType === "json"}
+                                autoComplete="off"
+                                fullWidth
+                                type={selectedType === "integer" || selectedType === "float" ? "number" : "text"}
+                              />
+                            )}
+                          </td>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            <Button
+                              onClick={e => { e.preventDefault(); handleRowUpdate(pid); }}
+                              size="slim"
+                              disabled={uploading}
+                            >Update</Button>
+                            <Button
+                              destructive
+                              size="slim"
+                              onClick={e => { e.preventDefault(); handleRowClear(pid); }}
+                              disabled={uploading}
+                              style={{ marginLeft: "6px" }}
+                            >
+                              Clear Values
+                            </Button>
+                          </td>
+                          <td style={{ padding: "8px", verticalAlign: "top" }}>
+                            {successMap[pid] && <Text variant="bodyMd" color="success">✅</Text>}
+                            {errorMap[pid] && <Text variant="bodyMd" color="critical">{errorMap[pid]}</Text>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
-    </Page>
-  );
+            {/* Save/Update Button */}
+            <Button
+              submit
+              primary
+              loading={fetcher.state === "submitting" || fetcher.state === "loading"}
+              disabled={
+                !selectedProductIds.length ||
+                !selectedDef ||
+                uploading ||
+                fetcher.state === "submitting" ||
+                fetcher.state === "loading"
+              }
+              style={{
+                backgroundColor: "#16a34a",
+                color: "white",
+                padding: "10px 20px",
+                borderRadius: "6px",
+              }}
+            >
+              Save All Metafields
+            </Button>
+          </form>
+        </Card>
+      </Layout.Section>
+    </Layout>
+
+    {/* NEW: Metafield Definition Creation Modal */}
+    <CreateMetafieldDefinitionModal
+      isOpen={showCreateModal}
+      onClose={() => setShowCreateModal(false)}
+      onSubmit={(definitionData) => {
+        const formData = new FormData();
+        formData.append("intent", "createMetafieldDefinition");
+        formData.append("namespace", definitionData.namespace);
+        formData.append("key", definitionData.key);
+        formData.append("name", definitionData.name);
+        formData.append("type", reverseTypeMap[definitionData.type] || definitionData.type);
+        formData.append("description", definitionData.description);
+        definitionFetcher.submit(formData, { method: "post", action: "." });
+      }}
+      isSubmitting={definitionFetcher.state === "submitting" || definitionFetcher.state === "loading"}
+      errors={definitionFetcher.data?.errors}
+    />
+  </Page>
+);
 }
