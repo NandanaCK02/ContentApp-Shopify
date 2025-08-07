@@ -1,5 +1,5 @@
 import { json } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
+import { useLoaderData, useFetcher, useActionData } from "@remix-run/react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import { PrismaClient } from "@prisma/client";
@@ -8,346 +8,487 @@ import {
   Layout,
   Card,
   Select,
-  TextField,
-  Button,
   Text,
   Spinner,
-  LegacyStack as Stack,
-}
- from "@shopify/polaris";
+  ChoiceList,
+  Button,
+  DataTable,
+  TextField,
+  Banner,
+} from "@shopify/polaris";
 
+// NOTE: Ensure your PrismaClient and shopify.server paths are correct
 const prisma = new PrismaClient();
 
-// --- GraphQL Queries and Mutations ---
+// GraphQL query to fetch all collections with pagination
 const COLLECTIONS_QUERY = `
   query getCollections($first: Int!, $after: String) {
     collections(first: $first, after: $after) {
-      edges {
-        cursor
-        node {
-          id
-          title
-        }
-      }
-      pageInfo {
-        hasNextPage
-      }
+      edges { cursor node { id title } }
+      pageInfo { hasNextPage }
     }
   }
 `;
 
-const PRODUCTS_BY_COLLECTION_QUERY = `
-  query productsByCollection($collectionId: ID!) {
+// GraphQL query to fetch a single page of products for a specific collection
+const PRODUCTS_PAGE_QUERY = `
+  query productsByCollectionWithPagination($collectionId: ID!, $first: Int!, $after: String) {
     node(id: $collectionId) {
       ... on Collection {
         id
         title
-        products(first: 100) {
+        products(first: $first, after: $after) {
           edges {
+            cursor
             node {
               id
               handle
               title
               variants(first: 10) {
-                edges {
-                  node {
-                    id
-                    sku
-                  }
-                }
+                edges { node { id sku } }
               }
             }
           }
+          pageInfo { hasNextPage }
         }
       }
     }
   }
 `;
 
-
-const METAFIELDS_UPDATE_MUTATION = `
-  mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      metafields {
-        id
-        key
-        namespace
-        value
-      }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-
-// --- Loader for initial data and dynamic fetching ---
+/**
+ * Remix Loader function to fetch initial data based on URL parameters.
+ * This is a highly flexible loader that responds to different query params
+ * to fetch collections, products, spec keys, or spec values as needed by the UI.
+ * @param {object} args - The Remix loader arguments.
+ * @returns {Promise<Response>} A JSON response containing the requested data.
+ */
 export async function loader({ request }) {
   try {
     const { admin } = await authenticate.admin(request);
     const url = new URL(request.url);
     const collectionId = url.searchParams.get("collectionId");
-    const sku = url.searchParams.get("sku");
+    const skuListString = url.searchParams.get("skuList");
+    const specKeysListString = url.searchParams.get("specKeys");
 
-    // --- Fetch products for a collection ---
-    if (collectionId) {
-      const res = await admin.graphql(PRODUCTS_BY_COLLECTION_QUERY, {
-        variables: { collectionId },
-      });
-
-      const data = await res.json(); // ✅ FIXED HERE
-
-      const productEdges = data?.data?.node?.products?.edges || [];
-
-      const products = productEdges.map(({ node }) => ({
-        id: node.id,
-        handle: node.handle,
-        title: node.title,
-        variants: node.variants.edges.map((v) => ({
-          id: v.node.id,
-          sku: v.node.sku,
-        })),
-      }));
-
-      return json({ products });
-    }
-
-    // --- Fetch specs for a SKU ---
-    if (sku) {
-      const rows = await prisma.specs.findMany({
-        where: { sku },
-        select: { spec_key: true, spec_value: true },
-      });
-      const specs = rows.reduce((acc, row) => {
-        acc[row.spec_key] = row.spec_value;
-        return acc;
-      }, {});
-      return json({ specs });
-    }
-
-    // --- Fetch all collections (initial load) ---
     let collections = [];
     let collectionCursor = null;
     let hasNextPage = true;
-
     while (hasNextPage) {
-      const variables = { first: 100, after: collectionCursor };
-      const res = await admin.graphql(COLLECTIONS_QUERY, { variables });
+      const res = await admin.graphql(COLLECTIONS_QUERY, {
+        variables: { first: 100, after: collectionCursor },
+      });
       const data = await res.json();
-
       const edges = data?.data?.collections?.edges || [];
       collections.push(...edges.map((e) => e.node));
-
       hasNextPage = data?.data?.collections?.pageInfo?.hasNextPage;
-      if (hasNextPage) {
-        collectionCursor = edges[edges.length - 1].cursor;
+      if (hasNextPage) collectionCursor = edges[edges.length - 1].cursor;
+    }
+
+    // --- Scenario 1: Initial page load
+    if (!collectionId && !skuListString && !specKeysListString) {
+      return json({ collections });
+    }
+
+    // --- Scenario 2: Collection is selected, fetch products and SKUs
+    if (collectionId && !skuListString && !specKeysListString) {
+      const products = [];
+      let hasMoreProducts = true;
+      let cursor = null;
+      const pageSize = 100;
+      const maxProducts = 500;
+      let count = 0;
+      while (hasMoreProducts && count < maxProducts) {
+        const res = await admin.graphql(PRODUCTS_PAGE_QUERY, {
+          variables: { collectionId, first: pageSize, after: cursor },
+        });
+        const data = await res.json();
+        const edges = data?.data?.node?.products?.edges || [];
+        for (const { node } of edges) {
+          if (count >= maxProducts) break;
+          products.push({
+            id: node.id,
+            handle: node.handle,
+            title: node.title,
+            variants: node.variants.edges.map((v) => ({
+              id: v.node.id,
+              sku: v.node.sku,
+            })),
+          });
+          count++;
+        }
+        hasMoreProducts = data?.data?.node?.products?.pageInfo?.hasNextPage;
+        cursor = edges.length ? edges[edges.length - 1].cursor : null;
+      }
+      const skus = products.flatMap((p) => p.variants.map((v) => v.sku)).filter(Boolean);
+      return json({ collections, products, skus });
+    }
+
+    // --- Scenario 3: SKUs are available, fetch unique spec keys
+    if (skuListString && !specKeysListString) {
+      const skus = skuListString.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!skus.length) return json({ collections, specKeys: [] });
+
+      const rows = await prisma.specifications.findMany({
+        where: { sku: { in: skus } },
+        select: { spec_key: true },
+        distinct: ["spec_key"],
+      });
+      const specKeys = rows.map((r) => r.spec_key);
+      return json({ collections, specKeys });
+    }
+
+    // --- Scenario 4: SKUs and spec keys are selected, fetch values for the editable table
+    if (skuListString && specKeysListString) {
+      const skus = skuListString.split(",").map((s) => s.trim()).filter(Boolean);
+      const specKeys = specKeysListString.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!skus.length || !specKeys.length) return json({ values: {} });
+
+      const rows = await prisma.specifications.findMany({
+        where: { sku: { in: skus }, spec_key: { in: specKeys } },
+      });
+      const values = {};
+      for (const row of rows) {
+        if (!values[row.sku]) values[row.sku] = {};
+        values[row.sku][row.spec_key] = row.spec_value;
+      }
+      return json({ values });
+    }
+
+    // Default return
+    return json({ collections });
+  } catch (error) {
+    console.error("[loader] Error:", error);
+    return json({ collections: [], products: [], skus: [], specKeys: [] }, { status: 500 });
+  }
+}
+
+/**
+ * Remix Action function to handle form submissions and update metafields.
+ * This function handles the "Save" action to persist the data to Shopify.
+ * @param {object} args - The Remix action arguments.
+ * @returns {Promise<Response>} A JSON response indicating the success or failure of the operation.
+ */
+export async function action({ request }) {
+  try {
+    const { admin } = await authenticate.admin(request);
+    const formData = await request.formData();
+
+    const collectionId = formData.get("collectionId");
+    const selectedKeys = JSON.parse(formData.get("selectedKeys") || "[]");
+    const valuesBySku = JSON.parse(formData.get("valuesBySku") || "{}");
+
+    if (!collectionId || selectedKeys.length === 0 || Object.keys(valuesBySku).length === 0) {
+      return json({ ok: false, error: "Missing required data" });
+    }
+
+    // 1. Update collection metafields Filter1..Filter20 to selected keys
+    for (let i = 0; i < selectedKeys.length && i < 20; i++) {
+      const input = {
+        namespace: "filters",
+        key: `filter${i + 1}`,
+        ownerId: collectionId,
+        type: "single_line_text_field",
+        value: selectedKeys[i],
+      };
+      const result = await admin.graphql(
+        `
+          mutation metafieldUpsert($input: MetafieldInput!) {
+            metafieldUpsert(input: $input) {
+              metafield { id }
+              userErrors { field message }
+            }
+          }
+        `,
+        { variables: { input } }
+      );
+      const userErrors = result?.data?.metafieldUpsert?.userErrors;
+      if (userErrors?.length) {
+        console.error(`[action] Collection metafield update errors filter${i + 1}:`, userErrors);
       }
     }
 
-    return json({ collections });
-
-  } catch (error) {
-    console.error("Loader error:", error);
-    return json(
-      {
-        collections: [],
-        products: [],
-        specs: {},
-        error: "Failed to load data",
-      },
-      { status: 500 }
-    );
-  }
-}
-
-
-// --- Action handler for form submissions (spec updates) ---
-export async function action({ request }) {
-  const { admin } = await authenticate.admin(request);
-  const formData = await request.formData();
-  const { _action, sku, spec_key, spec_value, ownerId } = Object.fromEntries(formData);
-
-  if (_action !== "updateSpec") {
-    return json({ success: false, error: "Invalid action" }, { status: 400 });
-  }
-
-  try {
-    // 1. Update your database
-    await prisma.specs.upsert({
-      where: { sku_spec_key: { sku, spec_key } },
-      create: { sku, spec_key, spec_value },
-      update: { spec_value },
+    // 2. Map SKU to productId using your variants table
+    const skus = Object.keys(valuesBySku);
+    const variantRows = await prisma.variants.findMany({
+      where: { sku: { in: skus } },
+      select: { sku: true, productId: true },
     });
+    const skuToProductId = {};
+    for (const v of variantRows) skuToProductId[v.sku] = v.productId;
 
-    // 2. Update the Shopify metafield
-    const variables = {
-      metafields: [{
-        ownerId,
-        namespace: "custom",
-        key: spec_key,
-        type: "single_line_text_field",
-        value: spec_value,
-      }],
-    };
-
-    const result = await admin.graphql(METAFIELDS_UPDATE_MUTATION, { variables });
-    const errors = result?.data?.metafieldsSet?.userErrors;
-
-    if (errors && errors.length > 0) {
-      console.error("Shopify Metafield API Error:", errors);
-      return json({ success: false, error: errors[0].message }, { status: 500 });
+    // 3. Update product metafields Filter1..Filter20 with corresponding values
+    for (const [sku, keyValues] of Object.entries(valuesBySku)) {
+      const productId = skuToProductId[sku];
+      if (!productId) {
+        console.warn(`[action] No productId found for SKU: ${sku}`);
+        continue;
+      }
+      for (let i = 0; i < selectedKeys.length && i < 20; i++) {
+        const val = keyValues[selectedKeys[i]] || "";
+        const input = {
+          namespace: "filters",
+          key: `filter${i + 1}`,
+          ownerId: productId,
+          type: "single_line_text_field",
+          value: val,
+        };
+        const result = await admin.graphql(
+          `
+            mutation metafieldUpsert($input: MetafieldInput!) {
+              metafieldUpsert(input: $input) {
+                metafield { id }
+                userErrors { field message }
+              }
+            }
+          `,
+          { variables: { input } }
+        );
+        const userErrors = result?.data?.metafieldUpsert?.userErrors;
+        if (userErrors?.length) {
+          console.error(`[action] Product SKU:${sku} metafield update errors filter${i + 1}:`, userErrors);
+        }
+      }
     }
-
-    return json({ success: true });
+    return json({ ok: true });
   } catch (error) {
-    console.error("Action handler error:", error);
-    return json({ success: false, error: "Server error" }, { status: 500 });
+    console.error("[action] Error:", error);
+    return json({ ok: false, error: "Failed to update metafields" }, { status: 500 });
   }
 }
 
-// --- React Component ---
+/**
+ * React UI component for the Spec Manager page.
+ * @returns {JSX.Element} The Spec Manager page UI.
+ */
 export default function SpecManagerPage() {
   const { collections } = useLoaderData();
+  
+  // Using separate fetchers for each step of the process
   const productsFetcher = useFetcher();
-  const specsFetcher = useFetcher();
+  const specKeysFetcher = useFetcher();
+  const specValuesFetcher = useFetcher();
+  const actionFetcher = useFetcher();
 
+  // State variables to manage the UI flow
   const [selectedCollectionId, setSelectedCollectionId] = useState("");
-  const [selectedProduct, setSelectedProduct] = useState(null);
-  const [localSpecs, setLocalSpecs] = useState({});
+  const [allSKUs, setAllSKUs] = useState([]);
+  const [selectedSpecKeys, setSelectedSpecKeys] = useState([]);
+  const [showEditTable, setShowEditTable] = useState(false);
+  const [editValues, setEditValues] = useState({});
+  const [productNameBySku, setProductNameBySku] = useState({});
 
-  // Fetch products when a collection is selected
+  // 1. When a collection is selected, fetch the products and SKUs
   useEffect(() => {
     if (selectedCollectionId) {
       productsFetcher.load(`?collectionId=${encodeURIComponent(selectedCollectionId)}`);
+      // Reset all other states to start fresh
+      setAllSKUs([]);
+      setSelectedSpecKeys([]);
+      setShowEditTable(false);
+      setEditValues({});
+      setProductNameBySku({});
+      actionFetcher.data = null; // Clear previous action data
     } else {
-      setSelectedProduct(null);
+        setAllSKUs([]);
+        setSelectedSpecKeys([]);
+        setShowEditTable(false);
+        setEditValues({});
+        setProductNameBySku({});
     }
   }, [selectedCollectionId]);
 
-  // Fetch specs when a product is selected
+  // 2. When products are fetched, fetch the unique spec keys
   useEffect(() => {
-    if (selectedProduct?.variants[0]?.sku) {
-      specsFetcher.load(`?sku=${encodeURIComponent(selectedProduct.variants[0].sku)}`);
+    const data = productsFetcher.data;
+    if (data?.skus?.length) {
+      setAllSKUs(data.skus);
+      // Map SKUs to product titles for the table
+      const map = {};
+      if (Array.isArray(data.products)) {
+        for (const p of data.products) {
+          for (const v of p.variants) {
+            if (v.sku) map[v.sku] = p.title;
+          }
+        }
+      }
+      setProductNameBySku(map);
+      // Now fetch the unique spec keys from the database
+      specKeysFetcher.load(`?skuList=${encodeURIComponent(data.skus.join(","))}`);
     } else {
-      setLocalSpecs({});
-    }
-  }, [selectedProduct]);
-
-  // Update local state with fetched products
-  useEffect(() => {
-    if (productsFetcher.data?.products) {
-      // Clear previous product selection when a new collection is loaded
-      setSelectedProduct(null);
+      setAllSKUs([]);
+      setSelectedSpecKeys([]);
+      setProductNameBySku({});
     }
   }, [productsFetcher.data]);
 
-  // Update local state with fetched specs
+  // 3. When spec values are fetched, show the editable table
   useEffect(() => {
-    if (specsFetcher.data?.specs) {
-      setLocalSpecs(specsFetcher.data.specs);
+    if (specValuesFetcher.data?.values) {
+      setEditValues(specValuesFetcher.data.values);
+      setShowEditTable(true);
     }
-  }, [specsFetcher.data]);
+  }, [specValuesFetcher.data]);
 
-  const handleSpecChange = (key, value) => {
-    setLocalSpecs((prev) => ({ ...prev, [key]: value }));
+  // Handler for the "Update" button
+  const handleUpdate = () => {
+    if (allSKUs.length > 0 && selectedSpecKeys.length > 0) {
+      specValuesFetcher.load(
+        `?skuList=${encodeURIComponent(allSKUs.join(","))}&specKeys=${encodeURIComponent(selectedSpecKeys.join(","))}`
+      );
+    }
   };
 
-  const handleSaveSpec = (specKey) => {
+  // Handler for updating a value in the editable table
+  const updateEditValue = (sku, key, value) => {
+    setEditValues((prev) => ({
+      ...prev,
+      [sku]: { ...(prev[sku] || {}), [key]: value },
+    }));
+  };
+
+  // Handler for the "Save" button
+  const handleSave = () => {
+    if (!selectedCollectionId || !selectedSpecKeys.length) return;
     const formData = new FormData();
-    formData.append("_action", "updateSpec");
-    formData.append("sku", selectedProduct.variants[0].sku);
-    formData.append("spec_key", specKey);
-    formData.append("spec_value", localSpecs[specKey]);
-    formData.append("ownerId", selectedProduct.variants[0].id);
+    formData.append("collectionId", selectedCollectionId);
+    formData.append("selectedKeys", JSON.stringify(selectedSpecKeys));
+    formData.append("valuesBySku", JSON.stringify(editValues));
 
-    productsFetcher.submit(formData, { method: "POST" });
+    // Submit the form data to the action function
+    actionFetcher.submit(formData, { method: "post" });
   };
 
+  // Format collections for the Polaris Select component
   const collectionOptions = [
     { label: "Select a collection...", value: "" },
-    ...collections.map((col) => ({ label: col.title, value: col.id })),
+    ...(collections || []).map((col) => ({ label: col.title, value: col.id })),
   ];
+
+  // Format spec keys for the Polaris ChoiceList component
+  const specKeyChoices = (specKeysFetcher.data?.specKeys || []).map((key) => ({
+    label: key,
+    value: key,
+  }));
+
+  // Create the rows for the DataTable
+  const tableRows = allSKUs.map((sku) => [
+    sku,
+    productNameBySku[sku] || "",
+    ...selectedSpecKeys.map((key) => (
+      <TextField
+        key={`${sku}-${key}`}
+        value={editValues[sku]?.[key] || ""}
+        onChange={(val) => updateEditValue(sku, key, val)}
+        autoComplete="off"
+      />
+    )),
+  ]);
 
   return (
     <Page title="Product Spec Manager">
       <Layout>
+        {/* Banner to show success/failure of the save action */}
+        {actionFetcher.data && (
+          <Layout.Section>
+            <Banner
+              status={actionFetcher.data.ok ? "success" : "critical"}
+              title={actionFetcher.data.ok ? "Saved successfully!" : actionFetcher.data.error || "Failed to save"}
+            >
+              {actionFetcher.data.ok ? "Metafields have been updated." : "Please check the console for more details."}
+            </Banner>
+          </Layout.Section>
+        )}
+
         <Layout.Section>
           <Card sectioned>
+            <Text variant="headingMd" as="h2">Step 1: Select a Collection</Text>
             <Select
               label="Collection"
+              labelHidden
               options={collectionOptions}
-              onChange={setSelectedCollectionId}
               value={selectedCollectionId}
+              onChange={setSelectedCollectionId}
+              disabled={showEditTable}
             />
           </Card>
         </Layout.Section>
-        
-        {selectedCollectionId && (
+
+        {/* Loading spinner while fetching products */}
+        {productsFetcher.state === "loading" && selectedCollectionId && (
           <Layout.Section>
-            <Card sectioned title="Products">
-              {productsFetcher.state === "loading" ? (
+            <Card sectioned>
+              <div style={{ textAlign: "center" }}><Spinner /></div>
+            </Card>
+          </Layout.Section>
+        )}
+
+        {/* Step 2: Select Spec Keys after SKUs are loaded */}
+        {allSKUs.length > 0 && !showEditTable && (
+          <Layout.Section>
+            <Card sectioned>
+              <Text variant="headingMd" as="h2">Step 2: Select Spec Keys</Text>
+              <Text variant="bodyMd" as="p" color="subdued">
+                {`Found ${allSKUs.length} unique SKUs in this collection. Select the specification keys you want to manage.`}
+              </Text>
+              {specKeysFetcher.state === "loading" ? (
                 <div style={{ textAlign: "center" }}><Spinner /></div>
               ) : (
-                productsFetcher.data?.products && productsFetcher.data.products.length > 0 ? (
-                  <ul style={{ listStyleType: "none", padding: 0 }}>
-                    {productsFetcher.data.products.map((product) => (
-                      <li
-                        key={product.id}
-                        onClick={() => setSelectedProduct(product)}
-                        style={{
-                          cursor: "pointer",
-                          padding: "8px",
-                          backgroundColor: selectedProduct?.id === product.id ? "#f0f6fd" : "white",
-                          borderBottom: "1px solid #e1e3e5",
-                        }}
+                <>
+                  <ChoiceList
+                    allowMultiple
+                    choices={specKeyChoices}
+                    selected={selectedSpecKeys}
+                    onChange={setSelectedSpecKeys}
+                    titleHidden
+                  />
+                  {selectedSpecKeys.length > 0 && (
+                    <div style={{ marginTop: '16px' }}>
+                      <Button
+                        primary
+                        onClick={handleUpdate}
+                        loading={specValuesFetcher.state === "loading"}
                       >
-                        <Text as="p" variant="bodyMd">
-                          {product.title} (SKU: {product.variants[0]?.sku || "N/A"})
-                        </Text>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <Text as="p">No products found in this collection.</Text>
-                )
+                        Update
+                      </Button>
+                    </div>
+                  )}
+                </>
               )}
             </Card>
           </Layout.Section>
         )}
 
-        {selectedProduct && (
+        {/* Step 3: Edit and Save Spec Values */}
+        {showEditTable && (
           <Layout.Section>
-            <Card sectioned title={`Specs for ${selectedProduct.title}`}>
-              {specsFetcher.state === "loading" ? (
-                <div style={{ textAlign: "center" }}><Spinner /></div>
-              ) : (
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", padding: "8px", borderBottom: "1px solid #ddd" }}>Spec Key</th>
-                      <th style={{ textAlign: "left", padding: "8px", borderBottom: "1px solid #ddd" }}>Spec Value</th>
-                      <th style={{ textAlign: "right", padding: "8px", borderBottom: "1px solid #ddd" }}>Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.keys(localSpecs).map((key) => (
-                      <tr key={key}>
-                        <td style={{ padding: "8px" }}><Text as="p" variant="bodyMd">{key}</Text></td>
-                        <td style={{ padding: "8px" }}>
-                          <TextField
-                            value={localSpecs[key] || ""}
-                            onChange={(value) => handleSpecChange(key, value)}
-                          />
-                        </td>
-                        <td style={{ textAlign: "right", padding: "8px" }}>
-                          <Button onClick={() => handleSaveSpec(key)}>Save</Button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+            <Card
+              sectioned
+              title="Step 3: Edit and Save Spec Values"
+              actions={[
+                {
+                  content: "Save",
+                  primary: true,
+                  onAction: handleSave,
+                  loading: actionFetcher.state === "submitting",
+                },
+                {
+                  content: "Cancel",
+                  onAction: () => {
+                    setShowEditTable(false);
+                    setEditValues({});
+                    setSelectedSpecKeys([]);
+                  },
+                },
+              ]}
+            >
+              <div style={{ overflowX: 'auto' }}>
+                <DataTable
+                  columnContentTypes={["text", "text", ...selectedSpecKeys.map(() => "text")]}
+                  headings={["SKU", "Product Name", ...selectedSpecKeys]}
+                  rows={tableRows}
+                />
+              </div>
             </Card>
           </Layout.Section>
         )}

@@ -1,19 +1,21 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
   provider = "mysql"
   url      = "mysql://root:rootmysql@localhost:3306/shopify_app"
 }
 
-model Session {
+model faq {
+  id           String @id
+  question     String
+  answer       String
+  resourceId   String
+  resourceType String
+}
+
+model session {
   id            String    @id
   shop          String
   state         String
@@ -30,21 +32,18 @@ model Session {
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
 }
-model Faq {
-  id           String      @id @default(uuid())
-  question     String
-  answer       String
-  resourceId   String   // stores Shopify resource ID (collection/page)
-  resourceType String   // "collections" or "pages"
-}
 
-model Specification {
-  id        Int      @id @default(autoincrement())
-  sku       String
-  specKey   String
-  specValue String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
+model Specifications {
+  id          Int      @id @default(autoincrement())
+  sku         String   @db.VarChar(100)
+  spec_key    String   @db.VarChar(255)
+  spec_value  String   @db.VarChar(255)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
 
+  @@unique([sku, spec_key], name: "sku_spec_key")
+
+
+  @@map("specifications") // Maps the Prisma model to the existing table name
+}
 
