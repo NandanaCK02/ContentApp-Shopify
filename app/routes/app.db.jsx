@@ -171,7 +171,7 @@ export async function action({ request }) {
     const metafieldsToUpsert = [];
     selectedKeys.slice(0, 20).forEach((key, i) => {
       metafieldsToUpsert.push({
-        namespace: "custom",
+        namespace: "custom",//gentech for general tech
         key: `filter_${i + 1}`,
         ownerId: collectionId,
         type: "single_line_text_field",
@@ -188,7 +188,7 @@ export async function action({ request }) {
       selectedKeys.slice(0, 20).forEach((key, i) => {
         const val = keyValues[key] || "";
         metafieldsToUpsert.push({
-          namespace: "custom",
+          namespace: "custom",//gentech for genraltech
           key: `filter_${i + 1}`,
           ownerId: productId,
           type: "single_line_text_field",
