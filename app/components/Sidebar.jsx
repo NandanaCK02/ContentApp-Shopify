@@ -8,7 +8,7 @@ const links = [
   { to: "/app/faq", label: " FAQ-Manager" },
   { to: "/app/collection", label: " Collections" },
   { to: "/app/coll_make", label: " Collection Making" },
-  
+   { to: "/app/specifications", label: " Specifications" },
  
   { to: "/app/db", label: " DB" },
   

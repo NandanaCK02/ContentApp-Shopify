@@ -41,7 +41,7 @@ model Specifications {
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
 
-  @@unique([sku, spec_key], name: "sku_spec_key")
+  @@unique([sku, spec_key, spec_value], name: "sku_spec_key_value")
 
 
   @@map("specifications") // Maps the Prisma model to the existing table name
