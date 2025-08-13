@@ -2,12 +2,11 @@ import { json } from "@remix-run/node";
 import { useLoaderData, useFetcher } from "@remix-run/react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
-import { PrismaClient } from "@prisma/client";
+import prisma from "../db.server";
 import {
   Page,
   Layout,
   Card,
-  Select,
   Text,
   Spinner,
   ChoiceList,
@@ -15,10 +14,12 @@ import {
   DataTable,
   TextField,
   Banner,
+  Autocomplete
 } from "@shopify/polaris";
 
-const prisma = new PrismaClient();
-
+// ------------------------------------
+// GraphQL Queries
+// ------------------------------------
 const COLLECTIONS_QUERY = `
   query getCollections($first: Int!, $after: String) {
     collections(first: $first, after: $after) {
@@ -41,14 +42,7 @@ const PRODUCTS_QUERY_WITH_METAFIELDS = `
               id
               handle
               title
-              variants(first: 10) {
-                edges {
-                  node {
-                    id
-                    sku
-                  }
-                }
-              }
+              variants(first: 10) { edges { node { id sku } } }
             }
           }
           pageInfo { hasNextPage }
@@ -58,6 +52,58 @@ const PRODUCTS_QUERY_WITH_METAFIELDS = `
   }
 `;
 
+const COLLECTION_FILTERS_QUERY = `
+  query getCollectionFilters($collectionId: ID!) {
+    node(id: $collectionId) {
+      ... on Collection {
+        id
+        metafields(first: 50, namespace: "custom") {
+          edges { node { key value namespace } }
+        }
+      }
+    }
+  }
+`;
+
+const COLLECTION_METAFIELDS_QUERY = `
+  query($id: ID!) {
+    node(id: $id) {
+      ... on Collection {
+        metafields(first: 100, namespace: "custom") {
+          edges { node { key namespace } }
+        }
+      }
+    }
+  }
+`;
+
+const PRODUCT_METAFIELDS_QUERY = `
+  query($id: ID!) {
+    node(id: $id) {
+      ... on Product {
+        metafields(first: 100, namespace: "custom") {
+          edges { node { key namespace } }
+        }
+      }
+    }
+  }
+`;
+
+// Bulk delete metafields mutation
+const BULK_DELETE_MUTATION = `
+  mutation metafieldsDelete($metafields: [MetafieldIdentifierInput!]!) {
+    metafieldsDelete(metafields: $metafields) {
+      deletedMetafields { namespace key }
+      userErrors { field message }
+    }
+  }
+`;
+
+const normalizeKey = (str) => (str || "").trim().toLowerCase().replace(/\s+/g, " ");
+
+// ------------------------------------
+// Loader
+// ------------------------------------
 export async function loader({ request }) {
   try {
     const { admin } = await authenticate.admin(request);
@@ -66,86 +112,112 @@ export async function loader({ request }) {
     const skuListString = url.searchParams.get("skuList");
     const specKeysListString = url.searchParams.get("specKeys");
 
+    // Fetch all collections
     let collections = [];
-    let collectionCursor = null;
-    let hasNextPage = true;
-    while (hasNextPage) {
-      const res = await admin.graphql(COLLECTIONS_QUERY, {
-        variables: { first: 100, after: collectionCursor },
-      });
+    let cursor = null, hasNext = true;
+    while (hasNext) {
+      const res = await admin.graphql(COLLECTIONS_QUERY, { variables: { first: 100, after: cursor } });
       const data = await res.json();
       const edges = data?.data?.collections?.edges || [];
-      collections.push(...edges.map((e) => e.node));
-      hasNextPage = data?.data?.collections?.pageInfo?.hasNextPage;
-      if (hasNextPage && edges.length > 0) collectionCursor = edges[edges.length - 1].cursor;
-      else break;
+      collections.push(...edges.map(e => e.node));
+      hasNext = data?.data?.collections?.pageInfo?.hasNextPage;
+      cursor = hasNext && edges.length ? edges[edges.length - 1].cursor : null;
     }
 
-    if (!collectionId && !skuListString && !specKeysListString) {
+    // If just listing collections
+    if (!collectionId && !skuListString && !specKeysListString)
       return json({ collections });
-    }
 
+    // Fetch products + spec keys for a given collection
     if (collectionId && !skuListString && !specKeysListString) {
-      const products = [];
-      let hasMoreProducts = true;
-      let cursor = null;
-      const pageSize = 100;
-      const maxProducts = 500;
-      let count = 0;
-      while (hasMoreProducts && count < maxProducts) {
-        const res = await admin.graphql(PRODUCTS_QUERY_WITH_METAFIELDS, {
-          variables: { collectionId, first: pageSize, after: cursor },
-        });
-        const data = await res.json();
-        const collectionNode = data?.data?.node;
-        const edges = collectionNode?.products?.edges || [];
-        for (const { node } of edges) {
-          if (count >= maxProducts) break;
-          products.push({
-            id: node.id,
-            handle: node.handle,
-            title: node.title,
-            variants: node.variants.edges.map((v) => ({
-              id: v.node.id,
-              sku: v.node.sku,
-            })),
-          });
-          count++;
-        }
-        hasMoreProducts = collectionNode?.products?.pageInfo?.hasNextPage;
-        cursor = edges.length ? edges[edges.length - 1].cursor : null;
+      let products = [];
+      let cur = null, hasMore = true;
+      while (hasMore && products.length < 500) {
+        const pdata = await admin.graphql(PRODUCTS_QUERY_WITH_METAFIELDS,
+          { variables: { collectionId, first: 100, after: cur } });
+        const data = await pdata.json();
+        const edges = data?.data?.node?.products?.edges || [];
+        products.push(...edges.map(e => ({
+          id: e.node.id,
+          handle: e.node.handle,
+          title: e.node.title,
+          variants: e.node.variants.edges.map(v => ({ id: v.node.id, sku: v.node.sku }))
+        })));
+        hasMore = data?.data?.node?.products?.pageInfo?.hasNextPage;
+        cur = edges.length ? edges[edges.length - 1].cursor : null;
       }
-      const skus = products.flatMap((p) => p.variants.map((v) => v.sku)).filter(Boolean);
+
+      const skus = products.flatMap(p => p.variants.map(v => v.sku)).filter(Boolean);
       const rows = await prisma.specifications.findMany({
         where: { sku: { in: skus } },
         select: { spec_key: true },
-        distinct: ["spec_key"],
+        distinct: ["spec_key"]
       });
-      const specKeys = rows.map((r) => r.spec_key);
-      return json({ collections, products, skus, specKeys });
+
+      const excludedKeys = new Set(["brand", "sku", "type"]);
+      const normalizedToOriginal = new Map();
+      for (const r of rows) {
+        const key = r.spec_key ? r.spec_key.trim() : "";
+        const norm = normalizeKey(key);
+        if (key && !excludedKeys.has(norm) && !normalizedToOriginal.has(norm)) {
+          normalizedToOriginal.set(norm, key);
+        }
+      }
+      const specKeys = Array.from(normalizedToOriginal.values())
+        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase(), "en", { sensitivity: "base" }));
+
+      let preselectedKeys = [];
+      try {
+        const resFilters = await admin.graphql(COLLECTION_FILTERS_QUERY, { variables: { collectionId } });
+        const filtersData = await resFilters.json();
+        // ✅ FIX: Only get current filter_* keys
+        const filterEdges = (filtersData?.data?.node?.metafields?.edges || [])
+          .filter(e => e.node.key.startsWith("filter_"));
+        const allValues = filterEdges
+          .map(e => e?.node?.value ? String(e.node.value).trim() : "")
+          .filter(Boolean);
+        const dedupe = new Set();
+        for (const val of allValues) {
+          const norm = normalizeKey(val);
+          const original = normalizedToOriginal.get(norm);
+          if (original && !dedupe.has(original)) dedupe.add(original);
+        }
+        preselectedKeys = Array.from(dedupe);
+      } catch (e) {
+        console.warn("[loader] Failed to fetch collection filters:", e);
+      }
+
+      return json({ collections, products, skus, specKeys, preselectedKeys });
     }
 
+    // Fetch values for given SKUs + keys
     if (skuListString && specKeysListString) {
-      const skus = skuListString.split(",").map((s) => s.trim()).filter(Boolean);
-      const specKeys = specKeysListString.split(",").map((s) => s.trim()).filter(Boolean);
-      if (!skus.length || !specKeys.length) return json({ values: {} });
-      const rows = await prisma.specifications.findMany({
-        where: { sku: { in: skus }, spec_key: { in: specKeys } },
-      });
+      const skus = skuListString.split(",").map(s => s.trim()).filter(Boolean);
+      const specKeysRaw = specKeysListString.split(",").map(s => s.trim()).filter(Boolean);
+      if (!skus.length || !specKeysRaw.length) return json({ values: {} });
+
+      const targetKeys = specKeysRaw.map(normalizeKey);
+      const allRows = await prisma.specifications.findMany({ where: { sku: { in: skus } } });
+      const filteredRows = allRows.filter(r => targetKeys.includes(normalizeKey(r.spec_key)));
+
       const values = {};
-      for (const row of rows) {
+      for (const row of filteredRows) {
         if (!values[row.sku]) values[row.sku] = {};
-        values[row.sku][row.spec_key] = row.spec_value;
+        values[row.sku][row.spec_key.trim()] = row.spec_value;
       }
       return json({ values });
     }
+
     return json({ collections });
-  } catch (error) {
-    console.error("[loader] Error:", error);
+  } catch (err) {
+    console.error("[loader] Error:", err);
     return json({ collections: [], products: [], skus: [], specKeys: [], values: {} }, { status: 500 });
   }
 }
 
+// ------------------------------------
+// Action — deletes old metafields before upserting new ones
+// ------------------------------------
 export async function action({ request }) {
   try {
     const { admin } = await authenticate.admin(request);
@@ -155,100 +227,127 @@ export async function action({ request }) {
     const valuesBySku = JSON.parse(formData.get("valuesBySku") || "{}");
     const productsData = JSON.parse(formData.get("productsData") || "[]");
 
-    if (!collectionId || !productsData || selectedKeys.length === 0 || Object.keys(valuesBySku).length === 0) {
-      return json({ ok: false, error: "Missing required data" });
-    }
+    if (!collectionId)
+      return json({ ok: false, error: "Missing collectionId" });
 
     const skuToProductId = {};
     productsData.forEach(p => {
-      p.variants.forEach(v => {
-        if (v.sku) {
-          skuToProductId[v.sku] = p.id;
+      p.variants.forEach(v => { if (v.sku) skuToProductId[v.sku] = p.id; });
+    });
+
+    // ---- Delete existing metafields from collection ----
+    const collRes = await admin.graphql(COLLECTION_METAFIELDS_QUERY, { variables: { id: collectionId } });
+    const collData = await collRes.json();
+    const collDeletes = (collData?.data?.node?.metafields?.edges || [])
+      .filter(e => e.node.key.startsWith("filter_"))
+      .map(e => ({ ownerId: collectionId, namespace: e.node.namespace, key: e.node.key }));
+
+    if (collDeletes.length) {
+      const delRes = await admin.graphql(BULK_DELETE_MUTATION, { variables: { metafields: collDeletes } });
+      const delJson = await delRes.json();
+      if (delJson?.data?.metafieldsDelete?.userErrors?.length)
+        throw new Error(delJson.data.metafieldsDelete.userErrors[0].message);
+    }
+
+    // ---- Delete existing metafields from products ----
+    for (const pid of Object.values(skuToProductId)) {
+      const prodRes = await admin.graphql(PRODUCT_METAFIELDS_QUERY, { variables: { id: pid } });
+      const prodData = await prodRes.json();
+      const prodDeletes = (prodData?.data?.node?.metafields?.edges || [])
+        .filter(e => e.node.key.startsWith("filter_"))
+        .map(e => ({ ownerId: pid, namespace: e.node.namespace, key: e.node.key }));
+
+      if (prodDeletes.length) {
+        const delRes = await admin.graphql(BULK_DELETE_MUTATION, { variables: { metafields: prodDeletes } });
+        const delJson = await delRes.json();
+        if (delJson?.data?.metafieldsDelete?.userErrors?.length)
+          throw new Error(delJson.data.metafieldsDelete.userErrors[0].message);
+      }
+    }
+
+    // ---- Prepare new metafields ----
+    const metafieldsToUpsert = [];
+    selectedKeys.slice(0, 20).forEach((key, i) => {
+      if (key?.trim()) {
+        metafieldsToUpsert.push({
+          namespace: "custom",
+          key: `filter_${i + 1}`,
+          ownerId: collectionId,
+          type: "single_line_text_field",
+          value: key.trim()
+        });
+      }
+    });
+
+    Object.entries(valuesBySku).forEach(([sku, keyValues]) => {
+      const pid = skuToProductId[sku];
+      if (!pid) return;
+      selectedKeys.slice(0, 20).forEach((key, i) => {
+        const val = keyValues[key]?.trim();
+        if (val !== undefined) {
+          metafieldsToUpsert.push({
+            namespace: "custom",
+            key: `filter_${i + 1}`,
+            ownerId: pid,
+            type: "single_line_text_field",
+            value: val
+          });
         }
       });
     });
 
-    const metafieldsToUpsert = [];
-    selectedKeys.slice(0, 20).forEach((key, i) => {
-      metafieldsToUpsert.push({
-        namespace: "custom",//gentech for general tech
-        key: `filter_${i + 1}`,
-        ownerId: collectionId,
-        type: "single_line_text_field",
-        value: key,
-      });
-    });
-
-    for (const [sku, keyValues] of Object.entries(valuesBySku)) {
-      const productId = skuToProductId[sku];
-      if (!productId) {
-        console.warn(`[action] No productId found for SKU: ${sku}`);
-        continue;
-      }
-      selectedKeys.slice(0, 20).forEach((key, i) => {
-        const val = keyValues[key] || "";
-        metafieldsToUpsert.push({
-          namespace: "custom",//gentech for genraltech
-          key: `filter_${i + 1}`,
-          ownerId: productId,
-          type: "single_line_text_field",
-          value: val,
-        });
-      });
-    }
-
-    if (metafieldsToUpsert.length > 0) {
-      const result = await admin.graphql(
-        `
-          mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-            metafieldsSet(metafields: $metafields) {
-              metafields { id }
-              userErrors { field message }
-            }
+    // ---- Shopify Upsert ----
+    if (metafieldsToUpsert.length) {
+      const UPSERT_MUTATION = `
+        mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { id }
+            userErrors { field message }
           }
-        `,
-        { variables: { metafields: metafieldsToUpsert } }
-      );
-      const data = await result.json();
-      const userErrors = data?.data?.metafieldsSet?.userErrors;
-      if (userErrors?.length) {
-        console.error("[action] Metafield update errors:", userErrors);
-        return json({ ok: false, error: userErrors[0].message }, { status: 500 });
+        }
+      `;
+      for (let i = 0; i < metafieldsToUpsert.length; i += 25) {
+        const batch = metafieldsToUpsert.slice(i, i + 25);
+        const res = await admin.graphql(UPSERT_MUTATION, { variables: { metafields: batch } });
+        const jsonRes = await res.json();
+        if (jsonRes?.data?.metafieldsSet?.userErrors?.length)
+          throw new Error(jsonRes.data.metafieldsSet.userErrors[0].message);
       }
     }
 
-    const dbUpdates = [];
-    for (const [sku, keyValues] of Object.entries(valuesBySku)) {
-      for (const [specKey, specValue] of Object.entries(keyValues)) {
-        dbUpdates.push(
-          prisma.specifications.upsert({
-            where: {
-              sku_spec_key: {
-                sku,
-                spec_key: specKey,
-              },
-            },
-            update: { spec_value: specValue || "" },
-            create: {
-              sku,
-              spec_key: specKey,
-              spec_value: specValue || "",
-            },
+    // ---- Prisma DB Update with unique constraint handling ----
+    const dbOps = [];
+    for (const [sku, kv] of Object.entries(valuesBySku)) {
+      for (const [specKey, specValue] of Object.entries(kv)) {
+        if (specValue === undefined) continue;
+        const existingExact = await prisma.specifications.findFirst({
+          where: { sku, spec_key: specKey, spec_value: specValue }
+        });
+        if (existingExact) continue;
+        await prisma.specifications.deleteMany({
+          where: { sku, spec_key: specKey }
+        });
+        dbOps.push(
+          prisma.specifications.create({
+            data: { sku, spec_key: specKey, spec_value: specValue }
           })
         );
       }
     }
-    if (dbUpdates.length > 0) {
-      await prisma.$transaction(dbUpdates);
+    if (dbOps.length > 0) {
+      await prisma.$transaction(dbOps);
     }
-    
+
     return json({ ok: true, message: "Saved successfully!" });
-  } catch (error) {
-    console.error("[action] Error:", error);
-    return json({ ok: false, error: "Failed to update metafields and database" }, { status: 500 });
+  } catch (err) {
+    console.error("[action] Error:", err);
+    return json({ ok: false, error: err.message || "Failed to update metafields and database" }, { status: 500 });
   }
 }
 
+// ------------------------------------
+// React Component (unchanged)
+// ------------------------------------
 export default function SpecManagerPage() {
   const { collections } = useLoaderData();
   const productsFetcher = useFetcher();
@@ -264,48 +363,41 @@ export default function SpecManagerPage() {
   const [productNameBySku, setProductNameBySku] = useState({});
   const [productsData, setProductsData] = useState([]);
   const [showSuccessBanner, setShowSuccessBanner] = useState(false);
+  const [collectionSearchQuery, setCollectionSearchQuery] = useState("");
 
-  // Updated effect with minimal fix — no resetting selectedCollectionId here
+  const filteredCollectionOptions = (collections || [])
+    .map(c => ({ label: c.title, value: c.id }))
+    .filter(opt => opt.label.toLowerCase().includes(collectionSearchQuery.toLowerCase()));
+  const selectedCollectionOption = selectedCollectionId ? [selectedCollectionId] : [];
+
+  const handleCollectionSelect = (selected) => {
+    const value = Array.isArray(selected) && selected.length ? selected[0] : "";
+    setSelectedCollectionId(value);
+  };
+
   useEffect(() => {
     if (actionFetcher.data?.ok) {
       setShowSuccessBanner(true);
-      setShowEditTable(false); // Hide edit table on success
+      setShowEditTable(false);
       setEditValues({});
       setSelectedSpecKeys([]);
       setProductsData([]);
       setAllSKUs([]);
       setAvailableSpecKeys([]);
       setProductNameBySku({});
-      // Do NOT reset selected collection here — allow user to select same or another collection again
-      // actionFetcher.data = null; // Optional: clear fetcher data after handling if needed
-    }
-    if (actionFetcher.data && !actionFetcher.data.ok) {
+    } else if (actionFetcher.data && !actionFetcher.data.ok) {
       setShowSuccessBanner(false);
     }
   }, [actionFetcher.data]);
 
-
   useEffect(() => {
     if (!selectedCollectionId) {
-      setAllSKUs([]);
-      setAvailableSpecKeys([]);
-      setSelectedSpecKeys([]);
-      setShowEditTable(false);
-      setEditValues({});
-      setProductNameBySku({});
-      setProductsData([]);
-      setShowSuccessBanner(false);
+      setAllSKUs([]); setAvailableSpecKeys([]); setSelectedSpecKeys([]);
+      setShowEditTable(false); setEditValues({}); setProductNameBySku({});
+      setProductsData([]); setShowSuccessBanner(false);
       return;
     }
     productsFetcher.load(`?collectionId=${encodeURIComponent(selectedCollectionId)}`);
-    setAllSKUs([]);
-    setAvailableSpecKeys([]);
-    setSelectedSpecKeys([]);
-    setShowEditTable(false);
-    setEditValues({});
-    setProductNameBySku({});
-    setProductsData([]);
-    setShowSuccessBanner(false);
   }, [selectedCollectionId]);
 
   useEffect(() => {
@@ -314,14 +406,9 @@ export default function SpecManagerPage() {
       setAllSKUs(data.skus);
       setAvailableSpecKeys(data.specKeys);
       setProductsData(data.products);
+      if (Array.isArray(data.preselectedKeys)) setSelectedSpecKeys(data.preselectedKeys);
       const map = {};
-      if (Array.isArray(data.products)) {
-        for (const p of data.products) {
-          for (const v of p.variants) {
-            if (v.sku) map[v.sku] = p.title;
-          }
-        }
-      }
+      (data.products || []).forEach(p => p.variants.forEach(v => { if (v.sku) map[v.sku] = p.title; }));
       setProductNameBySku(map);
     }
   }, [productsFetcher.data]);
@@ -333,28 +420,18 @@ export default function SpecManagerPage() {
     }
   }, [specValuesFetcher.data]);
 
-  useEffect(() => {
-    setShowEditTable(false);
-    setEditValues({});
-  }, [selectedSpecKeys]);
+  useEffect(() => { setShowEditTable(false); setEditValues({}); }, [selectedSpecKeys]);
 
   const handleUpdate = () => {
-    if (allSKUs.length > 0 && selectedSpecKeys.length > 0) {
-      specValuesFetcher.load(
-        `?skuList=${encodeURIComponent(allSKUs.join(","))}&specKeys=${encodeURIComponent(selectedSpecKeys.join(","))}`
-      );
-    }
+    specValuesFetcher.load(`?skuList=${encodeURIComponent(allSKUs.join(","))}&specKeys=${encodeURIComponent(selectedSpecKeys.join(","))}`);
   };
 
   const updateEditValue = (sku, key, value) => {
-    setEditValues((prev) => ({
-      ...prev,
-      [sku]: { ...(prev[sku] || {}), [key]: value },
-    }));
+    setEditValues(prev => ({ ...prev, [sku]: { ...(prev[sku] || {}), [key]: value } }));
   };
 
   const handleSave = () => {
-    if (!selectedCollectionId || selectedSpecKeys.length === 0) return;
+    if (!selectedCollectionId) return;
     const formData = new FormData();
     formData.append("collectionId", selectedCollectionId);
     formData.append("selectedKeys", JSON.stringify(selectedSpecKeys));
@@ -363,41 +440,28 @@ export default function SpecManagerPage() {
     actionFetcher.submit(formData, { method: "post" });
   };
 
-  const handleCancel = () => {
-    setShowEditTable(false);
-    setEditValues({});
-    setSelectedSpecKeys([]);
-  };
+  const handleCancel = () => { setShowEditTable(false); setEditValues({}); setSelectedSpecKeys([]); };
 
-  // Disable collection select only while loading or submitting
   const shouldDisableCollectionSelect = productsFetcher.state === "loading" || actionFetcher.state === "submitting";
+  const specKeyChoices = (availableSpecKeys || []).map(key => ({ label: key, value: key }));
 
-  const collectionOptions = [
-    { label: "Select a collection...", value: "" },
-    ...(collections || []).map((col) => ({ label: col.title, value: col.id })),
-  ];
-
-  const specKeyChoices = (availableSpecKeys || []).map((key) => ({
-    label: key,
-    value: key,
-  }));
-
-  const tableRows = allSKUs.map((sku) => [
+  const tableRows = allSKUs.map(sku => [
     sku,
     productNameBySku[sku] || "",
-    ...selectedSpecKeys.map((key) => (
-      <TextField
-        key={`${sku}-${key}`}
-        value={editValues[sku]?.[key] || ""}
-        onChange={(val) => updateEditValue(sku, key, val)}
-        autoComplete="off"
-        disabled={actionFetcher.state === "submitting"}
-      />
+    ...selectedSpecKeys.map(key => (
+      <div key={`${sku}-${key}`} style={{ minWidth: "200px" }}>
+        <TextField
+          value={editValues[sku]?.[key] || ""}
+          onChange={val => updateEditValue(sku, key, val)}
+          autoComplete="off"
+          disabled={actionFetcher.state === "submitting"}
+        />
+      </div>
     )),
   ]);
 
   return (
-    <Page title="Product Spec Manager">
+    <Page title="Filter Manager">
       <Layout>
         {showSuccessBanner && (
           <Layout.Section>
@@ -408,23 +472,37 @@ export default function SpecManagerPage() {
         )}
         {actionFetcher.data && !actionFetcher.data.ok && (
           <Layout.Section>
-            <Banner status="critical" title={actionFetcher.data.error || "Failed to save"}>
-              Please check the console for more details.
-            </Banner>
+            <Banner status="critical" title={actionFetcher.data.error || "Failed to save"} />
           </Layout.Section>
         )}
 
         <Layout.Section>
           <Card sectioned>
-            <Text variant="headingMd" as="h2">Step 1: Select a Collection</Text>
-            <Select
-              label="Collection"
-              labelHidden
-              options={collectionOptions}
-              value={selectedCollectionId}
-              onChange={setSelectedCollectionId}
-              disabled={shouldDisableCollectionSelect}
+            <Text variant="headingMd">Step 1: Select a Collection</Text>
+            <Autocomplete
+              allowMultiple={false}
+              options={filteredCollectionOptions}
+              selected={selectedCollectionOption}
+              onSelect={handleCollectionSelect}
+              loading={productsFetcher.state === "loading"}
+              textField={
+                <Autocomplete.TextField
+                  label="Collection"
+                  labelHidden
+                  placeholder="Search collections..."
+                  value={collectionSearchQuery}
+                  onChange={setCollectionSearchQuery}
+                  autoComplete="off"
+                  disabled={shouldDisableCollectionSelect}
+                />
+              }
             />
+            {selectedCollectionId && (
+              <Text variant="bodyMd" color="subdued" style={{ marginTop: "8px" }}>
+                Selected collection:{" "}
+                <strong>{collections.find(c => c.id === selectedCollectionId)?.title || ""}</strong>
+              </Text>
+            )}
           </Card>
         </Layout.Section>
 
@@ -439,35 +517,19 @@ export default function SpecManagerPage() {
         {allSKUs.length > 0 && !showEditTable && (
           <Layout.Section>
             <Card sectioned>
-              <Text variant="headingMd" as="h2">Step 2: Select Spec Keys</Text>
-              <Text variant="bodyMd" as="p" color="subdued">
-                {`Found ${allSKUs.length} unique SKUs in this collection. Select the specification keys you want to manage.`}
+              <Text variant="headingMd">Step 2: Select Specification Keys</Text>
+              <Text variant="bodyMd" color="subdued">
+                {`Found ${allSKUs.length} unique SKUs in this collection. Select the specification keys you want to use for filtering.`}
               </Text>
               {availableSpecKeys.length > 0 ? (
                 <>
-                  <ChoiceList
-                    allowMultiple
-                    choices={specKeyChoices}
-                    selected={selectedSpecKeys}
-                    onChange={setSelectedSpecKeys}
-                    titleHidden
-                  />
-                  {selectedSpecKeys.length > 0 && (
-                    <div style={{ marginTop: 16 }}>
-                      <Button
-                        primary
-                        onClick={handleUpdate}
-                        loading={specValuesFetcher.state === "loading"}
-                      >
-                        Update
-                      </Button>
-                    </div>
-                  )}
+                  <ChoiceList allowMultiple choices={specKeyChoices} selected={selectedSpecKeys} onChange={setSelectedSpecKeys} titleHidden />
+                  <div style={{ marginTop: 16 }}>
+                    <Button primary onClick={handleUpdate} loading={specValuesFetcher.state === "loading"}>Update</Button>
+                  </div>
                 </>
               ) : (
-                <Text variant="bodyMd" as="p" color="subdued">
-                  No specification keys found for the products in this collection.
-                </Text>
+                <Text variant="bodyMd" color="subdued">No specification keys found for the products in this collection.</Text>
               )}
             </Card>
           </Layout.Section>
@@ -484,22 +546,18 @@ export default function SpecManagerPage() {
                 />
               </div>
               <div style={{ marginTop: 16, display: "flex", gap: 8 }}>
-                <Button
-                  primary
-                  onClick={handleSave}
-                  loading={actionFetcher.state === "submitting"}
-                  disabled={actionFetcher.state === "submitting"}
-                >
-                  Save
-                </Button>
-                <Button
-                  onClick={handleCancel}
-                  disabled={actionFetcher.state === "submitting"}
-                >
-                  Cancel
-                </Button>
+                <Button primary onClick={handleSave} loading={actionFetcher.state === "submitting"} disabled={actionFetcher.state === "submitting"}>Save</Button>
+                <Button onClick={handleCancel} disabled={actionFetcher.state === "submitting"}>Cancel</Button>
               </div>
             </Card>
+          </Layout.Section>
+        )}
+
+        {selectedCollectionId && !showEditTable && (
+          <Layout.Section>
+            <div style={{ marginTop: "16px" }}>
+              <Button primary onClick={handleSave} loading={actionFetcher.state === "submitting"} disabled={actionFetcher.state === "submitting"}>Save to Clear Filters</Button>
+            </div>
           </Layout.Section>
         )}
       </Layout>
